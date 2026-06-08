@@ -7,6 +7,7 @@ mod sse;
 mod routes;
 
 use std::sync::Arc;
+use tokio::signal;
 use tower_http::cors::{CorsLayer, Any};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -20,11 +21,12 @@ async fn main() -> anyhow::Result<()> {
         .with_target(false)
         .init();
 
-    let config = config::Config::from_env();
+    let config = Arc::new(config::Config::from_env());
 
     tracing::info!("codewhale-proxy v0.1.0 starting");
     tracing::info!("Listening on: {}", config.listen_addr);
     tracing::info!("eswitch URL: {}", config.eswitch_url);
+    tracing::info!("Default model: {}", config.default_model);
 
     let client = Arc::new(client::DeepSeekClient::new(
         config.eswitch_url.clone(),
@@ -38,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("eswitch health check error: {}", e),
     }
 
-    let app = routes::create_router(client)
+    let app = routes::create_router(client, config.clone())
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
@@ -49,7 +51,21 @@ async fn main() -> anyhow::Result<()> {
     let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
     tracing::info!("Server ready on {}", config.listen_addr);
 
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            // Handle SIGTERM (from kill/systemd stop) and SIGINT (Ctrl+C)
+            let mut sigterm = signal::unix::signal(signal::unix::SignalKind::terminate())
+                .expect("Failed to create SIGTERM handler");
+            tokio::select! {
+                _ = sigterm.recv() => {
+                    tracing::info!("Received SIGTERM, shutting down gracefully...");
+                }
+                _ = signal::ctrl_c() => {
+                    tracing::info!("Received SIGINT, shutting down gracefully...");
+                }
+            }
+        })
+        .await?;
 
     Ok(())
 }

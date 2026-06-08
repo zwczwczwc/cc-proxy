@@ -322,14 +322,14 @@ impl SseStateMachine {
         if self.thinking_started {
             if !self.thinking_signature_sent {
                 events.push(SseEvent::ContentBlockDelta {
-                    index: self.content_index - 1,
+                    index: self.content_index,
                     delta: ContentBlockDeltaData::SignatureDelta {
                         signature: "sig_proxy_placeholder".to_string(),
                     },
                 });
             }
             events.push(SseEvent::ContentBlockStop {
-                index: self.content_index - 1,
+                index: self.content_index,
             });
             self.thinking_started = false;
         }
@@ -337,7 +337,7 @@ impl SseStateMachine {
         // Close text block
         if self.text_started {
             events.push(SseEvent::ContentBlockStop {
-                index: self.content_index - 1,
+                index: self.content_index,
             });
             self.text_started = false;
         }

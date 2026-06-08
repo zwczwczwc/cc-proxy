@@ -1,0 +1,18 @@
+# codewhale-proxy model mapping configuration
+# This file is loaded at /etc/codewhale-proxy/config.toml inside the container.
+# Outside containers, set MODEL_CONFIG_PATH env var to point to this file.
+
+[models]
+default = "deepseek-v4-pro"
+
+[models.mapping]
+"claude-opus-4-7" = "deepseek-v4-pro"
+"claude-opus-4-6" = "deepseek-v4-pro"
+"claude-opus-4-5" = "deepseek-v4-pro"
+"claude-opus-4" = "deepseek-v4-pro"
+"claude-sonnet-4-6" = "deepseek-v4-pro"
+"claude-sonnet-4-5" = "deepseek-v4-pro"
+"claude-sonnet-4" = "deepseek-v4-pro"
+"claude-haiku-4-5" = "deepseek-v4-pro"
+"claude-3-haiku" = "deepseek-v4-pro"
+"claude-haiku-4" = "deepseek-v4-pro"

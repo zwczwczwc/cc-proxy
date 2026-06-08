@@ -9,7 +9,6 @@ use tokio::time::timeout;
 
 use crate::anthropic::types::SseEvent;
 use crate::openai::converter::SseStateMachine;
-use crate::reasoning::requires::requires_reasoning_content;
 
 /// Convert an SseEvent to an axum SSE Event.
 pub fn sse_event_to_axum(event: &SseEvent) -> Event {
@@ -41,11 +40,11 @@ impl Stream for SseEventStream {
 /// Returns an axum Sse response.
 pub fn process_stream(
     model: String,
+    is_reasoning_model: bool,
     msg_id: String,
     mut body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(256);
-    let is_reasoning_model = requires_reasoning_content(&model);
 
     const MAX_SSE_BUF: usize = 4 * 1024 * 1024; // 4MB
     let idle_timeout = tokio::time::Duration::from_secs(300);

@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde_json::Value;
+use std::time::Duration;
 use crate::openai::types::ChatCompletionRequest;
 
 /// Sanitize error response body: truncate + redact sensitive fields.
@@ -26,7 +27,15 @@ pub struct DeepSeekClient {
 impl DeepSeekClient {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
-            client: Client::new(),
+            client: Client::builder()
+                .timeout(Duration::from_secs(300))
+                .read_timeout(Duration::from_secs(120))
+                .connect_timeout(Duration::from_secs(10))
+                .pool_idle_timeout(Duration::from_secs(60))
+                .tcp_keepalive(Duration::from_secs(60))
+                .pool_max_idle_per_host(4)
+                .build()
+                .expect("Failed to create HTTP client"),
             base_url,
             api_key,
         }

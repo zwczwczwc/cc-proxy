@@ -1,39 +1,30 @@
+use std::collections::HashMap;
 use serde_json::Value;
 use crate::anthropic::types::{MessagesRequest, Tool, ToolChoice};
+use crate::config::Config;
 use crate::openai::types::{ChatCompletionRequest, OpenAiTool, OpenAiFunction, StreamOptions};
 use crate::reasoning::sanitize::sanitize_thinking_mode_messages;
 use crate::reasoning::build_messages::build_chat_messages_with_reasoning;
 use crate::reasoning::requires::requires_reasoning_content;
+use crate::reasoning::prefix::compute_prefix_fingerprint;
 
-/// Map Claude model names to upstream DeepSeek model names.
-/// The `[1m]` suffix is stripped before lookup. Unknown models default to `deepseek-v4-pro`.
-fn map_model_to_upstream(model: &str) -> String {
-    // Strip [1m] suffix if present
+/// Map Claude model names to upstream DeepSeek model names using the config's model_mapping.
+/// The `[1m]` suffix is stripped before lookup. Unknown models fall back to config's default_model.
+fn map_model_to_upstream(model: &str, mapping: &HashMap<String, String>, default: &str) -> String {
     let clean = model.trim_end_matches("[1m]").trim();
-    match clean {
-        "claude-opus-4-7" | "claude-opus-4-6" | "claude-opus-4-5" | "claude-opus-4" => {
-            "deepseek-v4-pro".to_string()
-        }
-        "claude-sonnet-4-6" | "claude-sonnet-4-5" | "claude-sonnet-4" | "claude-3-5-sonnet" => {
-            "deepseek-v4-flash".to_string()
-        }
-        "claude-haiku-4-5" | "claude-3-haiku" | "claude-haiku-4" => {
-            "qwen3.6-inner-free".to_string()
-        }
-        // Already a DeepSeek model, pass through
-        m if m.starts_with("deepseek") => m.to_string(),
-        // Unknown, default to v4-pro
-        _ => "deepseek-v4-pro".to_string(),
+    // Check if it's already a DeepSeek model — pass through
+    if clean.starts_with("deepseek") {
+        return clean.to_string();
     }
+    mapping.get(clean).cloned().unwrap_or_else(|| default.to_string())
 }
 
 /// Convert Anthropic MessagesRequest to OpenAI ChatCompletionRequest.
-pub fn convert_request(req: &MessagesRequest) -> anyhow::Result<ChatCompletionRequest> {
+pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ChatCompletionRequest> {
     let model = req.model.clone();
-    let is_reasoning_model = requires_reasoning_content(&model);
-
     // Map Claude model names to DeepSeek model names for eswitch
-    let upstream_model = map_model_to_upstream(&model);
+    let upstream_model = map_model_to_upstream(&model, &config.model_mapping, &config.default_model);
+    let is_reasoning_model = requires_reasoning_content(&upstream_model);
 
     // Build OpenAI messages
     let messages = build_chat_messages_with_reasoning(
@@ -55,21 +46,22 @@ pub fn convert_request(req: &MessagesRequest) -> anyhow::Result<ChatCompletionRe
         } else {
             None
         },
-        temperature: req.temperature,
-        top_p: req.top_p,
+        temperature: None,
+        top_p: None,
         reasoning_effort: None,
         thinking: None,
         tools: None,
         tool_choice: None,
-        stop: req.stop_sequences.clone(),
+        stop: None,
     };
 
-    // Convert tools
+    // Convert tools (sorted by name for KV cache prefix stability)
     if let Some(tools) = &req.tools {
-        let openai_tools: Vec<OpenAiTool> = tools
+        let mut openai_tools: Vec<OpenAiTool> = tools
             .iter()
             .map(|t| convert_tool(t))
             .collect();
+        openai_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         openai_req.tools = Some(openai_tools);
     }
 
@@ -95,6 +87,20 @@ pub fn convert_request(req: &MessagesRequest) -> anyhow::Result<ChatCompletionRe
     let mut body = serde_json::to_value(&openai_req)?;
     sanitize_thinking_mode_messages(&mut body);
     openai_req = serde_json::from_value(body)?;
+
+    // F6 (simplified): Per-request prefix fingerprint for KV cache observability.
+    // No cross-request comparison — external monitoring aggregates and analyses.
+    let sys_prompt = openai_req.messages.first()
+        .and_then(|m| m.get("content").and_then(|v| v.as_str()))
+        .unwrap_or("");
+    let fingerprint = compute_prefix_fingerprint(sys_prompt, openai_req.tools.as_deref());
+    tracing::info!(
+        prefix_fingerprint = %fingerprint,
+        model = %openai_req.model,
+        msg_count = openai_req.messages.len(),
+        reasoning_effort = ?openai_req.reasoning_effort,
+        "OpenAI request built"
+    );
 
     Ok(openai_req)
 }
@@ -154,8 +160,25 @@ mod tests {
     use super::*;
     use crate::anthropic::types::{ContentValue, Message, SystemPrompt, ThinkingConfig};
 
+    /// Helper to create a minimal Config for tests.
+    fn test_config() -> Config {
+        let mut mapping = HashMap::new();
+        mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
+        mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-pro".to_string());
+        mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-pro".to_string());
+        Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            api_key: "test-key".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: mapping,
+            default_model: "deepseek-v4-pro".to_string(),
+        }
+    }
+
     #[test]
     fn test_basic_conversion() {
+        let config = test_config();
         let req = MessagesRequest {
             model: "deepseek-v4-pro".to_string(),
             system: Some(SystemPrompt::Text("You are helpful".to_string())),
@@ -175,7 +198,7 @@ mod tests {
             top_k: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &config).unwrap();
         assert_eq!(result.model, "deepseek-v4-pro");
         assert_eq!(result.messages.len(), 2);
         assert_eq!(result.messages[0]["role"], "system");
@@ -184,6 +207,7 @@ mod tests {
 
     #[test]
     fn test_thinking_enabled() {
+        let config = test_config();
         let req = MessagesRequest {
             model: "deepseek-v4-pro".to_string(),
             system: None,
@@ -207,13 +231,14 @@ mod tests {
             top_k: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &config).unwrap();
         assert_eq!(result.reasoning_effort, Some("max".to_string()));
         assert!(result.thinking.is_some());
     }
 
     #[test]
     fn test_thinking_adaptive() {
+        let config = test_config();
         let req = MessagesRequest {
             model: "deepseek-v4-pro".to_string(),
             system: None,
@@ -236,8 +261,112 @@ mod tests {
             top_k: None,
         };
 
-        let result = convert_request(&req).unwrap();
+        let result = convert_request(&req, &config).unwrap();
         assert_eq!(result.reasoning_effort, Some("high".to_string()));
         assert!(result.thinking.is_some());
+    }
+
+    #[test]
+    fn test_model_mapping_claude_to_deepseek() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "claude-sonnet-4".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_model_mapping_unknown_falls_back_to_default() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "some-unknown-model".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.model, "deepseek-v4-pro");
+    }
+
+    #[test]
+    fn test_model_mapping_deepseek_passthrough() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.model, "deepseek-v3");
+    }
+
+    #[test]
+    fn test_map_model_strips_1m_suffix() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro[1m]".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.model, "deepseek-v4-pro");
     }
 }

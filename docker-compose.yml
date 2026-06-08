@@ -1,0 +1,25 @@
+version: "3.8"
+
+services:
+  codewhale-proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: codewhale-proxy
+    # eswitch runs on host 127.0.0.1:11434 — use host network to reach it
+    network_mode: host
+    environment:
+      - LISTEN_ADDR=0.0.0.0:11435
+      - ESWITCH_URL=http://127.0.0.1:11434
+      - DEEPSEEK_API_KEY=not-needed
+      - RUST_LOG=info
+      - MODEL_CONFIG_PATH=/etc/codewhale-proxy/config.toml
+    volumes:
+      # Mount config from project root into container's expected path
+      - ./config.toml:/etc/codewhale-proxy/config.toml:ro
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

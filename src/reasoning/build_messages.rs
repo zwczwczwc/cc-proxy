@@ -17,11 +17,19 @@ fn compact_tool_result(content: &str) -> String {
     if content.len() <= HEAD + TAIL {
         content.to_string()
     } else {
+        // Safe UTF-8 char boundary slicing (P5-2: fix panic on multi-byte chars)
+        let head_end = content.char_indices().nth(HEAD).map(|(i, _)| i).unwrap_or(content.len());
+        let tail_start = content
+            .char_indices()
+            .rev()
+            .nth(TAIL)
+            .map(|(i, _)| i)
+            .unwrap_or(0);
         format!(
-            "{}...\n[{} chars truncated]\n...{}",
-            &content[..HEAD],
-            content.len() - HEAD - TAIL,
-            &content[content.len() - TAIL..]
+            "{}...\n[{} bytes truncated]\n...{}",
+            &content[..head_end],
+            content.len() - head_end - (content.len() - tail_start),
+            &content[tail_start..]
         )
     }
 }
@@ -245,7 +253,7 @@ fn tool_result_to_text(content: &crate::anthropic::types::ToolResultContent) -> 
     }
 }
 
-fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) -> Value {
+fn convert_assistant_message(content: &ContentValue, _include_reasoning: bool) -> Value {
     let blocks = match content {
         ContentValue::Text(text) => {
             return json!({
@@ -256,17 +264,17 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
         ContentValue::Blocks(b) => b,
     };
 
-    let mut thinking_parts: Vec<String> = Vec::new();
+    let mut _thinking_parts: Vec<String> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
 
     for block in blocks {
         match block {
             ContentBlock::Thinking { thinking, signature: _ } => {
-                thinking_parts.push(thinking.clone());
+                _thinking_parts.push(thinking.clone());
             }
             ContentBlock::RedactedThinking { data: _ } => {
-                thinking_parts.push("(redacted thinking)".to_string());
+                _thinking_parts.push("(redacted thinking)".to_string());
             }
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
@@ -285,17 +293,18 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
         }
     }
 
-    let thinking_text = thinking_parts.join("\n");
-    let has_reasoning = include_reasoning && !thinking_text.trim().is_empty();
+    // F5: reasoning_content is deliberately NOT sent back.
+    // Reference: Reasonix openai.go:209-214 — reasoning_content is a response-only field;
+    // re-sending it is counted as billable prompt input (~500 tokens/turn saved).
+    // Reference: Reasonix openai.go:447-448 — chatMessage struct comment confirms.
     let has_tool_calls = !tool_calls.is_empty();
     let text_content = text_parts.join("\n");
 
-    let reasoning_content = if has_reasoning {
-        Some(thinking_text)
-    } else if has_tool_calls {
-        // Placeholder: DeepSeek requires reasoning_content with tool_calls
+    let reasoning_content = if has_tool_calls {
+        // Placeholder: DeepSeek 400 requires reasoning_content with tool_calls
         Some("(reasoning omitted)".to_string())
     } else {
+        // Pure text messages: no reasoning_content injection
         None
     };
 
@@ -445,6 +454,8 @@ mod tests {
 
     #[test]
     fn test_assistant_with_thinking() {
+        // F5: reasoning_content is no longer injected for pure text messages.
+        // Reference: Reasonix openai.go:209-214 — reasoning_content is response-only.
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: ContentValue::Blocks(vec![
@@ -460,7 +471,8 @@ mod tests {
         let result = build_chat_messages_with_reasoning(None, &messages, true);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
-        assert_eq!(result[0]["reasoning_content"], "let me think...");
+        // F5: No reasoning_content for pure text messages (no tool_calls)
+        assert!(result[0].get("reasoning_content").is_none() || result[0]["reasoning_content"].is_null());
         assert_eq!(result[0]["content"], "here is the answer");
     }
 
