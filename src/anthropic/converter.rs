@@ -74,7 +74,13 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     if let Some(thinking) = &req.thinking {
         if thinking.is_enabled() {
             let budget = thinking.budget_tokens().unwrap_or(0);
-            let effort = if budget >= 4096 { "max" } else { "high" };
+            // For reasoning models, budget=0 (Adaptive mode) defaults to max.
+            // Otherwise, budget >= 4096 → max, budget < 4096 → high.
+            let effort = if budget >= 4096 || (is_reasoning_model && budget == 0) {
+                "max"
+            } else {
+                "high"
+            };
             apply_effort_direct(&mut openai_req, effort);
         } else {
             apply_effort_direct(&mut openai_req, "off");
@@ -262,7 +268,8 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
-        assert_eq!(result.reasoning_effort, Some("high".to_string()));
+        // Adaptive thinking on reasoning models now defaults to max (not high).
+        assert_eq!(result.reasoning_effort, Some("max".to_string()));
         assert!(result.thinking.is_some());
     }
 
