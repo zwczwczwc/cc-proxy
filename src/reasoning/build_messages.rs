@@ -253,7 +253,7 @@ fn tool_result_to_text(content: &crate::anthropic::types::ToolResultContent) -> 
     }
 }
 
-fn convert_assistant_message(content: &ContentValue, _include_reasoning: bool) -> Value {
+fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) -> Value {
     let blocks = match content {
         ContentValue::Text(text) => {
             return json!({
@@ -264,17 +264,17 @@ fn convert_assistant_message(content: &ContentValue, _include_reasoning: bool) -
         ContentValue::Blocks(b) => b,
     };
 
-    let mut _thinking_parts: Vec<String> = Vec::new();
+    let mut thinking_parts: Vec<String> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
 
     for block in blocks {
         match block {
             ContentBlock::Thinking { thinking, signature: _ } => {
-                _thinking_parts.push(thinking.clone());
+                thinking_parts.push(thinking.clone());
             }
             ContentBlock::RedactedThinking { data: _ } => {
-                _thinking_parts.push("(redacted thinking)".to_string());
+                thinking_parts.push("(redacted thinking)".to_string());
             }
             ContentBlock::Text { text } => {
                 text_parts.push(text.clone());
@@ -293,20 +293,26 @@ fn convert_assistant_message(content: &ContentValue, _include_reasoning: bool) -
         }
     }
 
-    // F5: reasoning_content is deliberately NOT sent back.
-    // Reference: Reasonix openai.go:209-214 — reasoning_content is a response-only field;
-    // re-sending it is counted as billable prompt input (~500 tokens/turn saved).
-    // Reference: Reasonix openai.go:447-448 — chatMessage struct comment confirms.
     let has_tool_calls = !tool_calls.is_empty();
     let text_content = text_parts.join("\n");
+    let mut reasoning_content_str = thinking_parts.join("\n");
 
-    let reasoning_content = if has_tool_calls {
-        // Placeholder: DeepSeek 400 requires reasoning_content with tool_calls
-        Some("(reasoning omitted)".to_string())
-    } else {
-        // Pure text messages: no reasoning_content injection
-        None
-    };
+    // Reasoning replay must be a function of the stored message ONLY,
+    // never of later history. DeepSeek's prefix cache hashes the raw
+    // bytes of every message; flipping reasoning_content on/off depending
+    // on whether a follow-up user turn exists rewrites a historical message
+    // between turns and busts the cache from that point onwards.
+    // Always emit reasoning_content when the model requires replay AND
+    // the stored message carries thinking text.
+    // Tool-call messages with empty thinking still need a placeholder
+    // (DeepSeek 400s without it), but text-only assistant messages
+    // simply omit the field when there's nothing to replay.
+    let mut has_reasoning = include_reasoning && !reasoning_content_str.trim().is_empty();
+    if include_reasoning && has_tool_calls && !has_reasoning {
+        tracing::warn!("Substituting placeholder reasoning_content for tool-call assistant message");
+        reasoning_content_str = "(reasoning omitted)".to_string();
+        has_reasoning = true;
+    }
 
     let mut msg = json!({
         "role": "assistant",
@@ -314,12 +320,14 @@ fn convert_assistant_message(content: &ContentValue, _include_reasoning: bool) -
 
     if !text_content.is_empty() {
         msg["content"] = json!(text_content);
+    } else if has_reasoning {
+        msg["content"] = json!(""); // DeepSeek rejects null content with reasoning
     } else {
         msg["content"] = json!(null);
     }
 
-    if let Some(rc) = reasoning_content {
-        msg["reasoning_content"] = json!(rc);
+    if has_reasoning {
+        msg["reasoning_content"] = json!(reasoning_content_str);
     }
 
     if has_tool_calls {
@@ -454,8 +462,8 @@ mod tests {
 
     #[test]
     fn test_assistant_with_thinking() {
-        // F5: reasoning_content is no longer injected for pure text messages.
-        // Reference: Reasonix openai.go:209-214 — reasoning_content is response-only.
+        // reasoning_content should contain actual thinking text when include_reasoning=true.
+        // Aligned with CodeWhale chat.rs L1549-L1591.
         let messages = vec![Message {
             role: "assistant".to_string(),
             content: ContentValue::Blocks(vec![
@@ -471,8 +479,8 @@ mod tests {
         let result = build_chat_messages_with_reasoning(None, &messages, true);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
-        // F5: No reasoning_content for pure text messages (no tool_calls)
-        assert!(result[0].get("reasoning_content").is_none() || result[0]["reasoning_content"].is_null());
+        // Fix: reasoning_content should contain actual thinking text
+        assert_eq!(result[0]["reasoning_content"], "let me think...");
         assert_eq!(result[0]["content"], "here is the answer");
     }
 
@@ -505,5 +513,71 @@ mod tests {
         assert_eq!(result.len(), 2);
         assert_eq!(result[0]["role"], "system");
         assert_eq!(result[0]["content"], "You are helpful");
+    }
+
+    #[test]
+    fn test_assistant_with_thinking_and_tool_calls() {
+        // Thinking + ToolUse combination: reasoning_content should be actual thinking text
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: ContentValue::Blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "I should read the file".to_string(),
+                    signature: "sig1".to_string(),
+                },
+                ContentBlock::ToolUse {
+                    id: "toolu_1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/test"}),
+                },
+            ]),
+        }];
+        let result = build_chat_messages_with_reasoning(None, &messages, true);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["role"], "assistant");
+        assert_eq!(result[0]["reasoning_content"], "I should read the file");
+        assert!(result[0]["tool_calls"].is_array());
+    }
+
+    #[test]
+    fn test_assistant_include_reasoning_false() {
+        // include_reasoning=false: reasoning_content should be omitted even with thinking
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: ContentValue::Blocks(vec![
+                ContentBlock::Thinking {
+                    thinking: "let me think...".to_string(),
+                    signature: "sig1".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "here is the answer".to_string(),
+                },
+            ]),
+        }];
+        let result = build_chat_messages_with_reasoning(None, &messages, false);
+        assert_eq!(result.len(), 1);
+        assert!(result[0].get("reasoning_content").is_none()
+            || result[0]["reasoning_content"].is_null());
+        assert_eq!(result[0]["content"], "here is the answer");
+    }
+
+    #[test]
+    fn test_assistant_redacted_thinking() {
+        // RedactedThinking block should be included as "(redacted thinking)" text
+        let messages = vec![Message {
+            role: "assistant".to_string(),
+            content: ContentValue::Blocks(vec![
+                ContentBlock::RedactedThinking {
+                    data: "encrypted_data".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "redacted response".to_string(),
+                },
+            ]),
+        }];
+        let result = build_chat_messages_with_reasoning(None, &messages, true);
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["reasoning_content"], "(redacted thinking)");
+        assert_eq!(result[0]["content"], "redacted response");
     }
 }

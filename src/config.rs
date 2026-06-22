@@ -89,10 +89,10 @@ impl Config {
         mapping.insert("claude-sonnet-4-5".to_string(), "deepseek-v4-pro".to_string());
         mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-pro".to_string());
         mapping.insert("claude-3-5-sonnet".to_string(), "deepseek-v4-pro".to_string());
-        // Claude Haiku variants
-        mapping.insert("claude-haiku-4-5".to_string(), "deepseek-v4-pro".to_string());
-        mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-pro".to_string());
-        mapping.insert("claude-3-haiku".to_string(), "deepseek-v4-pro".to_string());
+        // Claude Haiku variants → v4-flash (lighter, cost-effective)
+        mapping.insert("claude-haiku-4-5".to_string(), "deepseek-v4-flash".to_string());
+        mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-flash".to_string());
+        mapping.insert("claude-3-haiku".to_string(), "deepseek-v4-flash".to_string());
         (mapping, "deepseek-v4-pro".to_string())
     }
 }

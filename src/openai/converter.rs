@@ -408,6 +408,8 @@ mod tests {
                 prompt_tokens: Some(10),
                 completion_tokens: Some(5),
                 total_tokens: Some(15),
+                prompt_cache_hit_tokens: None,
+                prompt_cache_miss_tokens: None,
             }),
         };
 

@@ -119,6 +119,12 @@ pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
     pub total_tokens: Option<u32>,
+    /// DeepSeek: tokens served from KV cache (~98% cheaper)
+    #[serde(default)]
+    pub prompt_cache_hit_tokens: Option<u32>,
+    /// DeepSeek: tokens NOT served from cache (billed at full price)
+    #[serde(default)]
+    pub prompt_cache_miss_tokens: Option<u32>,
 }
 
 // --- Model list response ---

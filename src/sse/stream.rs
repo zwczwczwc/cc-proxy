@@ -61,6 +61,7 @@ pub fn process_stream(
 
         let mut buffer = String::new();
         let mut done = false;
+        let mut last_usage: Option<crate::openai::types::Usage> = None;
 
         loop {
             let chunk_result = match timeout(idle_timeout, stream.next()).await {
@@ -122,6 +123,9 @@ pub fn process_stream(
                             chunk_value.get("usage").and_then(|u| {
                                 serde_json::from_value(u.clone()).ok()
                             });
+                        if let Some(ref u) = usage {
+                            last_usage = Some(u.clone());
+                        }
 
                         // Extract choices
                         if let Some(choices) = chunk_value.get("choices").and_then(|v| v.as_array()) {
@@ -208,6 +212,22 @@ pub fn process_stream(
             let final_events = state_machine.finalize(None, None);
             for event in &final_events {
                 let _ = tx.send(sse_event_to_axum(event)).await;
+            }
+        }
+
+        // Log KV cache statistics if available
+        if let Some(ref u) = last_usage {
+            let hit = u.prompt_cache_hit_tokens.unwrap_or(0);
+            let miss = u.prompt_cache_miss_tokens.unwrap_or(0);
+            let total = hit + miss;
+            if total > 0 {
+                let rate = (hit as f64 / total as f64) * 100.0;
+                tracing::info!(
+                    cache_hit = hit,
+                    cache_miss = miss,
+                    hit_rate = format!("{:.1}%", rate),
+                    "KV cache stats"
+                );
             }
         }
     });
