@@ -6,6 +6,7 @@ use axum::{
     routing::post,
 };
 use std::sync::Arc;
+use std::time::Duration;
 use uuid::Uuid;
 use crate::anthropic::types::MessagesRequest;
 use crate::anthropic::converter::convert_request;
@@ -14,6 +15,8 @@ use crate::openai::converter::convert_non_stream_response;
 use crate::client::DeepSeekClient;
 use crate::reasoning::requires::requires_reasoning_content;
 use crate::sse::stream::process_stream;
+
+const MAX_RETRIES: u32 = 3;
 
 pub fn routes(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router {
     Router::new()
@@ -45,53 +48,83 @@ async fn handle_messages(
     };
 
     if stream {
-        // Streaming response
-        match client.chat_completion_stream(&openai_req).await {
-            Ok(byte_stream) => {
-                let upstream_model = &openai_req.model;
-                let is_reasoning_model = requires_reasoning_content(upstream_model);
-                let sse_response = process_stream(model, is_reasoning_model, msg_id, byte_stream);
-                sse_response.into_response()
-            }
-            Err(e) => {
-                tracing::error!("Stream request error: {}", e);
-                (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                    "type": "error",
-                    "error": {
-                        "type": "api_error",
-                        "message": format!("Upstream error: {}", e),
-                    }
-                }))).into_response()
-            }
-        }
-    } else {
-        // Non-streaming response
-        match client.chat_completion(&openai_req).await {
-            Ok(openai_resp) => {
-                match serde_json::from_value::<crate::openai::types::ChatCompletionResponse>(openai_resp) {
-                    Ok(parsed) => {
-                        let anthropic_resp = convert_non_stream_response(&parsed, &model, &msg_id);
-                        (StatusCode::OK, Json(anthropic_resp)).into_response()
-                    }
-                    Err(e) => {
-                        tracing::error!("Response parsing error: {}", e);
-                        (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                            "type": "error",
-                            "error": {
-                                "type": "api_error",
-                                "message": format!("Failed to parse response: {}", e),
-                            }
-                        }))).into_response()
-                    }
+        // Streaming response — retry on connection failure
+        let mut retries = 0;
+        let byte_stream = loop {
+            match client.chat_completion_stream(&openai_req).await {
+                Ok(s) => break s,
+                Err(e) if retries < MAX_RETRIES => {
+                    retries += 1;
+                    let delay = Duration::from_secs(2u64.pow(retries));
+                    tracing::warn!(
+                        "Stream request failed: {}, retrying in {:?} ({}/{})",
+                        e, delay, retries, MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Stream request failed after {} retries: {}",
+                        MAX_RETRIES, e
+                    );
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": format!("Upstream error after {} retries: {}", MAX_RETRIES, e),
+                        }
+                    }))).into_response();
                 }
             }
+        };
+        let upstream_model = &openai_req.model;
+        let is_reasoning_model = requires_reasoning_content(upstream_model);
+        let sse_response = process_stream(model, is_reasoning_model, msg_id, byte_stream);
+        sse_response.into_response()
+    } else {
+        // Non-streaming response — retry on connection failure
+        let mut retries = 0;
+        let openai_resp = loop {
+            match client.chat_completion(&openai_req).await {
+                Ok(r) => break r,
+                Err(e) if retries < MAX_RETRIES => {
+                    retries += 1;
+                    let delay = Duration::from_secs(2u64.pow(retries));
+                    tracing::warn!(
+                        "Non-stream request failed: {}, retrying in {:?} ({}/{})",
+                        e, delay, retries, MAX_RETRIES
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+                Err(e) => {
+                    tracing::error!(
+                        "Non-stream request failed after {} retries: {}",
+                        MAX_RETRIES, e
+                    );
+                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
+                        "type": "error",
+                        "error": {
+                            "type": "api_error",
+                            "message": format!("Upstream error after {} retries: {}", MAX_RETRIES, e),
+                        }
+                    }))).into_response();
+                }
+            }
+        };
+        match serde_json::from_value::<crate::openai::types::ChatCompletionResponse>(openai_resp) {
+            Ok(parsed) => {
+                let anthropic_resp = convert_non_stream_response(&parsed, &model, &msg_id);
+                (StatusCode::OK, Json(anthropic_resp)).into_response()
+            }
             Err(e) => {
-                tracing::error!("Upstream request error: {}", e);
+                tracing::error!("Response parsing error: {}", e);
                 (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                     "type": "error",
                     "error": {
                         "type": "api_error",
-                        "message": format!("Upstream error: {}", e),
+                        "message": format!("Failed to parse response: {}", e),
                     }
                 }))).into_response()
             }

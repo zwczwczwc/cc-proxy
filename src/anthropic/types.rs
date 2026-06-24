@@ -223,6 +223,17 @@ pub enum SseEvent {
     },
     #[serde(rename = "message_stop")]
     MessageStop,
+    #[serde(rename = "error")]
+    Error {
+        error: ErrorData,
+    },
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ErrorData {
+    #[serde(rename = "type")]
+    pub error_type: String,
+    pub message: String,
 }
 
 #[derive(Debug, Clone, Serialize)]

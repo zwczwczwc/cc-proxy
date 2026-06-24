@@ -127,7 +127,7 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
             apply_effort_direct(&mut openai_req, "off");
         }
     } else if is_reasoning_model {
-        apply_effort_direct(&mut openai_req, "high");
+        apply_effort_direct(&mut openai_req, "xhigh");
     }
 
     // Sanitize messages
@@ -211,7 +211,7 @@ mod tests {
     fn test_config() -> Config {
         let mut mapping = HashMap::new();
         mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
-        mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-pro".to_string());
+        mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-flash".to_string());
         mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-pro".to_string());
         Config {
             listen_addr: "0.0.0.0:11435".to_string(),
@@ -337,7 +337,7 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
-        assert_eq!(result.model, "deepseek-v4-pro");
+        assert_eq!(result.model, "deepseek-v4-flash");
     }
 
     #[test]

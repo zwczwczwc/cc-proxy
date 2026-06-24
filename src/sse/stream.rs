@@ -20,6 +20,7 @@ pub fn sse_event_to_axum(event: &SseEvent) -> Event {
         SseEvent::ContentBlockStop { .. } => Event::default().event("content_block_stop").data(json),
         SseEvent::MessageDelta { .. } => Event::default().event("message_delta").data(json),
         SseEvent::MessageStop => Event::default().event("message_stop").data(json),
+        SseEvent::Error { .. } => Event::default().event("error").data(json),
     }
 }
 
@@ -69,8 +70,14 @@ pub fn process_stream(
                 Ok(Some(Err(e))) => Err(e),
                 Ok(None) => break, // stream ended
                 Err(_elapsed) => {
-                    tracing::warn!("SSE stream idle timeout after 300s");
-                    break;
+                    let error_event = sse_event_to_axum(&SseEvent::Error {
+                        error: crate::anthropic::types::ErrorData {
+                            error_type: "timeout".to_string(),
+                            message: "Upstream stream idle timeout after 300s".to_string(),
+                        },
+                    });
+                    let _ = tx.send(error_event).await;
+                    return;
                 }
             };
 
@@ -201,10 +208,28 @@ pub fn process_stream(
                     }
                 }
                 Err(e) => {
-                    tracing::error!("Stream error: {}", e);
-                    break;
+                    let error_event = sse_event_to_axum(&SseEvent::Error {
+                        error: crate::anthropic::types::ErrorData {
+                            error_type: "stream_error".to_string(),
+                            message: format!("{}", e),
+                        },
+                    });
+                    let _ = tx.send(error_event).await;
+                    return;
                 }
             }
+        }
+
+        // Drain remaining chunks after [DONE] to prevent stale events in cc-connect
+        // (10s timeout protection against upstream hanging)
+        if let Err(_) = timeout(
+            tokio::time::Duration::from_secs(10),
+            async {
+                use futures_util::StreamExt;
+                while let Some(_) = stream.next().await {}
+            },
+        ).await {
+            tracing::warn!("Drain timeout after 10s, dropping stream");
         }
 
         // If stream ended without finish_reason, finalize
@@ -230,6 +255,9 @@ pub fn process_stream(
                 );
             }
         }
+
+        // Explicitly drop the sender to close the SSE channel
+        drop(tx);
     });
 
     Sse::new(SseEventStream { receiver: rx })
