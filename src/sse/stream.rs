@@ -48,7 +48,12 @@ pub fn process_stream(
     let (tx, rx) = mpsc::channel::<Event>(256);
 
     const MAX_SSE_BUF: usize = 4 * 1024 * 1024; // 4MB
-    let idle_timeout = tokio::time::Duration::from_secs(300);
+    let idle_timeout = tokio::time::Duration::from_secs(
+        std::env::var("PROXY_STREAM_IDLE_TIMEOUT_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(600),
+    );
 
     tokio::spawn(async move {
         let mut state_machine = SseStateMachine::new(is_reasoning_model);
@@ -62,6 +67,7 @@ pub fn process_stream(
 
         let mut buffer = String::new();
         let mut done = false;
+        let mut completed = false; // dsv4-cc-proxy pattern: prevent duplicate finalize
         let mut last_usage: Option<crate::openai::types::Usage> = None;
 
         loop {
@@ -70,13 +76,12 @@ pub fn process_stream(
                 Ok(Some(Err(e))) => Err(e),
                 Ok(None) => break, // stream ended
                 Err(_elapsed) => {
-                    let error_event = sse_event_to_axum(&SseEvent::Error {
-                        error: crate::anthropic::types::ErrorData {
-                            error_type: "timeout".to_string(),
-                            message: "Upstream stream idle timeout after 300s".to_string(),
-                        },
-                    });
-                    let _ = tx.send(error_event).await;
+                    tracing::warn!("SSE stream idle timeout after {:?}", idle_timeout);
+                    // Close all open blocks and send proper termination
+                    let final_events = state_machine.finalize(None, None);
+                    for event in &final_events {
+                        let _ = tx.send(sse_event_to_axum(event)).await;
+                    }
                     return;
                 }
             };
@@ -160,8 +165,12 @@ pub fn process_stream(
                                             }
                                         }
 
-                                        // Handle finish_reason
+                                        // Handle finish_reason (dsv4-cc-proxy pattern: idempotent)
                                         if let Some(fr) = finish_reason {
+                                            if completed {
+                                                continue;
+                                            }
+                                            completed = true;
                                             let final_events = state_machine.finalize(Some(fr), output_tokens);
                                             for event in &final_events {
                                                 if tx.send(sse_event_to_axum(event)).await.is_err() {
@@ -173,6 +182,10 @@ pub fn process_stream(
                                         }
                                     } else if finish_reason.is_some() {
                                         // Delta was None but finish_reason is set
+                                        if completed {
+                                            continue;
+                                        }
+                                        completed = true;
                                         let final_events = state_machine.finalize(finish_reason, output_tokens);
                                         for event in &final_events {
                                             if tx.send(sse_event_to_axum(event)).await.is_err() {
@@ -183,6 +196,10 @@ pub fn process_stream(
                                         break;
                                     }
                                 } else if let Some(fr) = finish_reason {
+                                    if completed {
+                                        continue;
+                                    }
+                                    completed = true;
                                     let output_tokens = usage
                                         .as_ref()
                                         .and_then(|u| u.completion_tokens);
@@ -232,8 +249,21 @@ pub fn process_stream(
             tracing::warn!("Drain timeout after 10s, dropping stream");
         }
 
-        // If stream ended without finish_reason, finalize
-        if !done {
+        // Handle [DONE] without finish_reason (the empty response bug)
+        // When [DONE] is received, done=true but finalize() was never called.
+        if done && !completed {
+            tracing::warn!("[DONE] received without finish_reason — finalizing stream");
+            completed = true;
+            let final_events = state_machine.finalize(None, None);
+            for event in &final_events {
+                let _ = tx.send(sse_event_to_axum(event)).await;
+            }
+        }
+
+        // If stream ended naturally without finish_reason or [DONE], finalize
+        if !done && !completed {
+            tracing::warn!("Stream ended without finish_reason or [DONE] — sending empty finalize");
+            completed = true;
             let final_events = state_machine.finalize(None, None);
             for event in &final_events {
                 let _ = tx.send(sse_event_to_axum(event)).await;

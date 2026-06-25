@@ -28,8 +28,7 @@ impl DeepSeekClient {
     pub fn new(base_url: String, api_key: String) -> Self {
         Self {
             client: Client::builder()
-                .timeout(Duration::from_secs(300))
-                .read_timeout(Duration::from_secs(120))
+                .read_timeout(Duration::from_secs(600))
                 .connect_timeout(Duration::from_secs(10))
                 .pool_idle_timeout(Duration::from_secs(60))
                 .tcp_keepalive(Duration::from_secs(60))

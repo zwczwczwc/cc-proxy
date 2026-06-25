@@ -16,7 +16,14 @@ use crate::client::DeepSeekClient;
 use crate::reasoning::requires::requires_reasoning_content;
 use crate::sse::stream::process_stream;
 
-const MAX_RETRIES: u32 = 3;
+const DEFAULT_MAX_RETRIES: u32 = 2;
+
+fn max_retries() -> u32 {
+    std::env::var("PROXY_MAX_RETRIES")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        .unwrap_or(DEFAULT_MAX_RETRIES)
+}
 
 pub fn routes(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router {
     Router::new()
@@ -47,18 +54,19 @@ async fn handle_messages(
         }
     };
 
+    let max_retries = max_retries();
     if stream {
         // Streaming response — retry on connection failure
         let mut retries = 0;
         let byte_stream = loop {
             match client.chat_completion_stream(&openai_req).await {
                 Ok(s) => break s,
-                Err(e) if retries < MAX_RETRIES => {
+                Err(e) if retries < max_retries => {
                     retries += 1;
                     let delay = Duration::from_secs(2u64.pow(retries));
                     tracing::warn!(
                         "Stream request failed: {}, retrying in {:?} ({}/{})",
-                        e, delay, retries, MAX_RETRIES
+                        e, delay, retries, max_retries
                     );
                     tokio::time::sleep(delay).await;
                     continue;
@@ -66,13 +74,13 @@ async fn handle_messages(
                 Err(e) => {
                     tracing::error!(
                         "Stream request failed after {} retries: {}",
-                        MAX_RETRIES, e
+                        max_retries, e
                     );
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": format!("Upstream error after {} retries: {}", MAX_RETRIES, e),
+                            "message": format!("Upstream error after {} retries: {}", max_retries, e),
                         }
                     }))).into_response();
                 }
@@ -88,12 +96,12 @@ async fn handle_messages(
         let openai_resp = loop {
             match client.chat_completion(&openai_req).await {
                 Ok(r) => break r,
-                Err(e) if retries < MAX_RETRIES => {
+                Err(e) if retries < max_retries => {
                     retries += 1;
                     let delay = Duration::from_secs(2u64.pow(retries));
                     tracing::warn!(
                         "Non-stream request failed: {}, retrying in {:?} ({}/{})",
-                        e, delay, retries, MAX_RETRIES
+                        e, delay, retries, max_retries
                     );
                     tokio::time::sleep(delay).await;
                     continue;
@@ -101,13 +109,13 @@ async fn handle_messages(
                 Err(e) => {
                     tracing::error!(
                         "Non-stream request failed after {} retries: {}",
-                        MAX_RETRIES, e
+                        max_retries, e
                     );
                     return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
                         "type": "error",
                         "error": {
                             "type": "api_error",
-                            "message": format!("Upstream error after {} retries: {}", MAX_RETRIES, e),
+                            "message": format!("Upstream error after {} retries: {}", max_retries, e),
                         }
                     }))).into_response();
                 }
