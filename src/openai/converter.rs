@@ -410,6 +410,7 @@ mod tests {
                 total_tokens: Some(15),
                 prompt_cache_hit_tokens: None,
                 prompt_cache_miss_tokens: None,
+                prompt_tokens_details: None,
             }),
         };
 

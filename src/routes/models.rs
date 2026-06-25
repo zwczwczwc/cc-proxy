@@ -36,6 +36,12 @@ async fn handle_models() -> Json<serde_json::Value> {
                 "object": "model",
                 "created": 1725148800,
                 "owned_by": "deepseek"
+            },
+            {
+                "id": "glm-5.2",
+                "object": "model",
+                "created": 1725148800,
+                "owned_by": "zhipuai"
             }
         ]
     }))

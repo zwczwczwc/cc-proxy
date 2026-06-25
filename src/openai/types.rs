@@ -36,6 +36,9 @@ pub struct StreamOptions {
 pub struct DeepSeekThinking {
     #[serde(rename = "type")]
     pub thinking_type: String,
+    /// GLM-5.2: preserved thinking mode (clear_thinking=false)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clear_thinking: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +128,14 @@ pub struct Usage {
     /// DeepSeek: tokens NOT served from cache (billed at full price)
     #[serde(default)]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// GLM-5.2: cached tokens via prompt_tokens_details
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
+}
+
+/// GLM-5.2: prompt_tokens_details from usage response
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct PromptTokensDetails {
+    pub cached_tokens: Option<u32>,
 }
 
 // --- Model list response ---

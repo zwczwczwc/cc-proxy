@@ -8,6 +8,11 @@ pub fn requires_reasoning_content(model: &str) -> bool {
         return true;
     }
 
+    // GLM-5 series (glm-5.1, glm-5.2) — reasoning models
+    if model_lower.starts_with("glm-5") {
+        return true;
+    }
+
     // DeepSeek chat/reasoner aliases
     if model_lower == "deepseek-chat" || model_lower == "deepseek-reasoner" {
         return true;

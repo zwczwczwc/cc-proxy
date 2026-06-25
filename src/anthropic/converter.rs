@@ -16,6 +16,10 @@ fn map_model_to_upstream(model: &str, mapping: &HashMap<String, String>, default
     if clean.starts_with("deepseek") {
         return clean.to_string();
     }
+    // Check if it's a GLM model — pass through directly
+    if clean.starts_with("glm") {
+        return clean.to_string();
+    }
     mapping.get(clean).cloned().unwrap_or_else(|| default.to_string())
 }
 
@@ -130,6 +134,15 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
         apply_effort_direct(&mut openai_req, "xhigh");
     }
 
+    // GLM-5.2: 保留式思考需要 clear_thinking=false 在 thinking 对象内
+    // 注意：此字段必须在 thinking 内部（非顶层），序列化为:
+    // {"thinking": {"type": "enabled", "clear_thinking": false}}
+    if openai_req.model.starts_with("glm-5") {
+        if let Some(ref mut thinking) = openai_req.thinking {
+            thinking.clear_thinking = Some(false);
+        }
+    }
+
     // Sanitize messages
     let mut body = serde_json::to_value(&openai_req)?;
     sanitize_thinking_mode_messages(&mut body);
@@ -157,6 +170,7 @@ fn apply_effort_direct(req: &mut ChatCompletionRequest, effort: &str) {
         "off" | "disabled" | "none" | "false" => {
             req.thinking = Some(crate::openai::types::DeepSeekThinking {
                 thinking_type: "disabled".to_string(),
+                clear_thinking: None,
             });
             req.reasoning_effort = None;
         }
@@ -164,18 +178,21 @@ fn apply_effort_direct(req: &mut ChatCompletionRequest, effort: &str) {
             req.reasoning_effort = Some("high".to_string());
             req.thinking = Some(crate::openai::types::DeepSeekThinking {
                 thinking_type: "enabled".to_string(),
+                clear_thinking: None,
             });
         }
         "max" | "xhigh" => {
             req.reasoning_effort = Some("max".to_string());
             req.thinking = Some(crate::openai::types::DeepSeekThinking {
                 thinking_type: "enabled".to_string(),
+                clear_thinking: None,
             });
         }
         _ => {
             req.reasoning_effort = Some("high".to_string());
             req.thinking = Some(crate::openai::types::DeepSeekThinking {
                 thinking_type: "enabled".to_string(),
+                clear_thinking: None,
             });
         }
     }

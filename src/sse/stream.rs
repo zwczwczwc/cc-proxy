@@ -272,8 +272,23 @@ pub fn process_stream(
 
         // Log KV cache statistics if available
         if let Some(ref u) = last_usage {
-            let hit = u.prompt_cache_hit_tokens.unwrap_or(0);
-            let miss = u.prompt_cache_miss_tokens.unwrap_or(0);
+            // Try DeepSeek format first (hit+miss), then GLM format (cached_tokens)
+            let (hit, miss) = {
+                let ds_hit = u.prompt_cache_hit_tokens.unwrap_or(0);
+                let ds_miss = u.prompt_cache_miss_tokens.unwrap_or(0);
+                if ds_hit > 0 || ds_miss > 0 {
+                    (ds_hit, ds_miss)
+                } else if let Some(ref details) = u.prompt_tokens_details {
+                    if let Some(cached) = details.cached_tokens {
+                        let total_prompt = u.prompt_tokens.unwrap_or(0);
+                        (cached, total_prompt.saturating_sub(cached))
+                    } else {
+                        (0, 0)
+                    }
+                } else {
+                    (0, 0)
+                }
+            };
             let total = hit + miss;
             if total > 0 {
                 let rate = (hit as f64 / total as f64) * 100.0;
