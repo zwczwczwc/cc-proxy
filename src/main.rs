@@ -9,6 +9,7 @@ mod routes;
 use std::sync::Arc;
 use tokio::signal;
 use tower_http::cors::{CorsLayer, Any};
+use axum::extract::DefaultBodyLimit;
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
@@ -41,6 +42,7 @@ async fn main() -> anyhow::Result<()> {
     }
 
     let app = routes::create_router(client, config.clone())
+        .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
