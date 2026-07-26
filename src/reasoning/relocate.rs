@@ -189,6 +189,10 @@ pub fn migrate_volatile_system_blocks(
                 text: appendix,
             });
         }
+        crate::anthropic::types::ContentValue::Null => {
+            // Convert null content to text so we can append the relocated context
+            last_msg.content = crate::anthropic::types::ContentValue::Text(appendix);
+        }
     }
 
     tracing::info!(

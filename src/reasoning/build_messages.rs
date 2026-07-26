@@ -153,6 +153,7 @@ fn system_prompt_to_text(sys: &SystemPrompt) -> String {
 fn content_value_to_json(content: &ContentValue) -> Value {
     match content {
         ContentValue::Text(s) => json!(s),
+        ContentValue::Null => Value::Null,
         ContentValue::Blocks(blocks) => {
             let items: Vec<Value> = blocks
                 .iter()
@@ -172,6 +173,7 @@ fn content_value_to_json(content: &ContentValue) -> Value {
 fn convert_user_message(content: &ContentValue) -> Value {
     match content {
         ContentValue::Text(s) => json!(s),
+        ContentValue::Null => Value::Null,
         ContentValue::Blocks(blocks) => {
             // Check if it's a simple text block array
             let all_text = blocks.iter().all(|b| matches!(b, ContentBlock::Text { .. }));
@@ -240,12 +242,12 @@ fn tool_result_to_text(content: &crate::anthropic::types::ToolResultContent) -> 
         crate::anthropic::types::ToolResultContent::Blocks(blocks) => {
             blocks
                 .iter()
-                .filter_map(|b| {
-                    if b.block_type == "text" {
-                        Some(b.text.clone())
-                    } else {
-                        None
+                .filter_map(|b| match b {
+                    crate::anthropic::types::ToolResultContentBlock::Text { text } => Some(text.clone()),
+                    crate::anthropic::types::ToolResultContentBlock::Image { source: _ } => {
+                        Some("[image]".to_string())
                     }
+                    crate::anthropic::types::ToolResultContentBlock::Unknown => None,
                 })
                 .collect::<Vec<_>>()
                 .join("\n")
@@ -259,6 +261,12 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
             return json!({
                 "role": "assistant",
                 "content": text,
+            });
+        }
+        ContentValue::Null => {
+            return json!({
+                "role": "assistant",
+                "content": null,
             });
         }
         ContentValue::Blocks(b) => b,

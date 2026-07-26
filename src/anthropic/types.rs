@@ -42,9 +42,44 @@ pub struct Message {
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
+enum ContentValueInner {
+    Text(String),
+    Blocks(Vec<ContentBlock>),
+    /// Catch-all: captures any value that Text and Blocks cannot handle.
+    /// Enables logging the actual value instead of failing with 422.
+    Raw(serde_json::Value),
+}
+
+#[derive(Debug, Clone)]
 pub enum ContentValue {
     Text(String),
     Blocks(Vec<ContentBlock>),
+    /// Anthropic API allows `null` content for assistant messages with only tool_calls.
+    Null,
+}
+
+impl<'de> Deserialize<'de> for ContentValue {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let inner = ContentValueInner::deserialize(deserializer)?;
+        Ok(match inner {
+            ContentValueInner::Text(s) => ContentValue::Text(s),
+            ContentValueInner::Blocks(b) => ContentValue::Blocks(b),
+            ContentValueInner::Raw(v) => {
+                // Log the unexpected value so we can see the actual root cause
+                let preview = format!("{}", v);
+                let preview = if preview.len() > 500 { &preview[..500] } else { &preview };
+                tracing::warn!(
+                    raw_type = if v.is_null() { "null" } else if v.is_string() { "string" } else if v.is_array() { "array" } else if v.is_object() { "object" } else if v.is_number() { "number" } else if v.is_boolean() { "boolean" } else { "unknown" },
+                    raw_preview = %preview,
+                    "ContentValue::Raw: unexpected content format, treating as Null"
+                );
+                ContentValue::Null
+            }
+        })
+    }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -76,20 +111,30 @@ pub enum ContentBlock {
     Image {
         source: ImageSource,
     },
+    /// Catch-all for unknown content block types (e.g., server_tool_use, search_result)
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
-    Blocks(Vec<ToolResultTextBlock>),
+    Blocks(Vec<ToolResultContentBlock>),
 }
 
+/// A single content block inside a tool_result.
+/// Anthropic API supports text and image blocks in tool results.
 #[derive(Debug, Clone, Deserialize)]
-pub struct ToolResultTextBlock {
-    #[serde(rename = "type")]
-    pub block_type: String,
-    pub text: String,
+#[serde(tag = "type")]
+pub enum ToolResultContentBlock {
+    #[serde(rename = "text")]
+    Text { text: String },
+    #[serde(rename = "image")]
+    Image { source: ImageSource },
+    /// Catch-all for unknown block types in tool results
+    #[serde(other)]
+    Unknown,
 }
 
 #[derive(Debug, Clone, Deserialize)]
