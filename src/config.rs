@@ -273,34 +273,44 @@ impl Config {
             });
 
         if let Some(path) = config_path {
-            if let Ok(contents) = fs::read_to_string(&path) {
-                match toml::from_str::<ConfigFile>(&contents) {
-                    Ok(cf) => {
-                        let mapping = cf
-                            .models
-                            .as_ref()
-                            .and_then(|m| m.mapping.clone())
-                            .unwrap_or_default();
-                        let default = cf
-                            .models
-                            .as_ref()
-                            .and_then(|m| m.default.clone())
-                            .unwrap_or_else(|| "deepseek-v4-pro".to_string());
-                        let providers =
-                            cf.providers.unwrap_or_else(Self::builtin_default_providers);
-                        let model_profiles = cf
-                            .model_profiles
-                            .unwrap_or_else(Self::builtin_default_profiles);
-                        tracing::info!("Loaded model config from {}", path.display());
-                        return (mapping, default, model_profiles, providers);
+            match fs::read_to_string(&path) {
+                Ok(contents) => {
+                    match toml::from_str::<ConfigFile>(&contents) {
+                        Ok(cf) => {
+                            let mapping = cf
+                                .models
+                                .as_ref()
+                                .and_then(|m| m.mapping.clone())
+                                .unwrap_or_default();
+                            let default = cf
+                                .models
+                                .as_ref()
+                                .and_then(|m| m.default.clone())
+                                .unwrap_or_else(|| "deepseek-v4-pro".to_string());
+                            let providers =
+                                cf.providers.unwrap_or_else(Self::builtin_default_providers);
+                            let model_profiles = cf
+                                .model_profiles
+                                .unwrap_or_else(Self::builtin_default_profiles);
+                            tracing::info!("Loaded model config from {}", path.display());
+                            return (mapping, default, model_profiles, providers);
+                        }
+                        Err(e) => {
+                            panic!(
+                                "Failed to parse model config from {}: {}. \
+                                 Config file must be valid TOML. Fix the syntax error or remove the file.",
+                                path.display(),
+                                e
+                            );
+                        }
                     }
-                    Err(e) => {
-                        tracing::warn!(
-                            "Failed to parse model config from {}: {}, using defaults",
-                            path.display(),
-                            e
-                        );
-                    }
+                }
+                Err(e) => {
+                    panic!(
+                        "Failed to read config file {}: {}",
+                        path.display(),
+                        e
+                    );
                 }
             }
         }
@@ -451,5 +461,163 @@ impl Config {
                 aliases: vec![],
             },
         ]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_config_file_parse_with_providers_and_profiles() {
+        let toml_str = r#"
+[models]
+default = "deepseek-v4-pro"
+
+[providers.deepseek]
+reasoning_field = "reasoning_content"
+reasoning_field_alt = []
+thinking_param = "thinking"
+thinking_type_enabled = "enabled"
+thinking_type_disabled = "disabled"
+disable_thinking = false
+effort_param = "reasoning_effort"
+
+[providers.deepseek.effort_map]
+low = "high"
+high = "high"
+max = "max"
+
+[providers.fireworks]
+reasoning_field = "reasoning"
+reasoning_field_alt = ["reasoning_details"]
+disable_thinking = true
+effort_param = "reasoning_effort"
+
+[providers.fireworks.effort_map]
+low = "low"
+high = "high"
+max = "max"
+
+[[model_profiles]]
+name = "deepseek-v4-pro"
+provider = "deepseek"
+reasoning_enabled = true
+reasoning_replay = true
+toolcall_requires_reasoning = true
+aliases = ["deepseek-chat"]
+
+[[model_profiles]]
+name = "kimi-k3"
+provider = "fireworks"
+reasoning_enabled = true
+reasoning_replay = true
+aliases = []
+"#;
+
+        let cf: ConfigFile = toml::from_str(toml_str).expect("TOML should parse");
+
+        // Verify providers are parsed
+        let providers = cf.providers.expect("providers should be Some");
+        assert_eq!(providers.len(), 2);
+        assert!(providers.contains_key("deepseek"));
+        assert!(providers.contains_key("fireworks"));
+
+        // Verify provider fields
+        let ds = &providers["deepseek"];
+        assert_eq!(ds.reasoning_field, "reasoning_content");
+        assert_eq!(ds.thinking_param.as_deref(), Some("thinking"));
+        assert!(!ds.disable_thinking);
+
+        let fw = &providers["fireworks"];
+        assert_eq!(fw.reasoning_field, "reasoning");
+        assert_eq!(fw.reasoning_field_alt, vec!["reasoning_details".to_string()]);
+        assert!(fw.disable_thinking);
+        assert!(fw.thinking_param.is_none());
+
+        // Verify model_profiles are parsed
+        let profiles = cf.model_profiles.expect("model_profiles should be Some");
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].name, "deepseek-v4-pro");
+        assert_eq!(profiles[0].provider, "deepseek");
+        assert_eq!(profiles[1].name, "kimi-k3");
+        assert_eq!(profiles[1].provider, "fireworks");
+    }
+
+    #[test]
+    #[should_panic(expected = "unknown provider")]
+    fn test_validate_panics_on_unknown_provider() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning_content".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: Some("thinking".to_string()),
+                thinking_type_enabled: Some("enabled".to_string()),
+                thinking_type_disabled: Some("disabled".to_string()),
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+            },
+        );
+
+        let model_profiles = vec![ModelProfile {
+            name: "bad-model".to_string(),
+            provider: "nonexistent".to_string(), // does not exist in providers
+            reasoning_enabled: false,
+            reasoning_replay: false,
+            toolcall_requires_reasoning: false,
+            aliases: vec![],
+        }];
+
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: HashMap::new(),
+            default_model: "bad-model".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config.validate(); // should panic
+    }
+
+    #[test]
+    fn test_fireworks_provider_optional_fields() {
+        // Verify that fireworks (no thinking_param) parses correctly
+        let toml_str = r#"
+[providers.fireworks]
+reasoning_field = "reasoning"
+reasoning_field_alt = ["reasoning_details"]
+disable_thinking = true
+effort_param = "reasoning_effort"
+
+[providers.fireworks.effort_map]
+low = "low"
+high = "high"
+max = "max"
+
+[[model_profiles]]
+name = "kimi-k3"
+provider = "fireworks"
+reasoning_enabled = true
+"#;
+
+        let cf: ConfigFile = toml::from_str(toml_str).expect("TOML should parse");
+        let providers = cf.providers.expect("providers should be Some");
+        let fw = &providers["fireworks"];
+        assert_eq!(fw.reasoning_field, "reasoning");
+        assert!(fw.thinking_param.is_none(), "thinking_param should be None for fireworks");
+        assert!(fw.thinking_type_enabled.is_none());
+        assert!(fw.thinking_type_disabled.is_none());
     }
 }

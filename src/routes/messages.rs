@@ -25,6 +25,18 @@ fn max_retries() -> u32 {
         .unwrap_or(DEFAULT_MAX_RETRIES)
 }
 
+/// Look up the reasoning field names for a model from the config.
+/// Returns (reasoning_field, reasoning_field_alt).
+fn get_reasoning_fields(model: &str, config: &Config) -> (String, Vec<String>) {
+    if let Some(profile) = config.model_profile(model) {
+        if let Some(provider) = config.provider_config(&profile.provider) {
+            return (provider.reasoning_field.clone(), provider.reasoning_field_alt.clone());
+        }
+    }
+    // Fallback: try common field names (Phase 1 compatibility)
+    ("reasoning_content".to_string(), vec!["reasoning".to_string()])
+}
+
 pub fn routes(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_messages))
@@ -88,7 +100,8 @@ async fn handle_messages(
         };
         let upstream_model = &openai_req.model;
         let is_reasoning_model = requires_reasoning_content(upstream_model, &config);
-        let sse_response = process_stream(model, is_reasoning_model, msg_id, byte_stream);
+        let (reasoning_field, reasoning_field_alt) = get_reasoning_fields(upstream_model, &config);
+        let sse_response = process_stream(model, is_reasoning_model, reasoning_field, reasoning_field_alt, msg_id, byte_stream);
         sse_response.into_response()
     } else {
         // Non-streaming response — retry on connection failure
@@ -123,7 +136,9 @@ async fn handle_messages(
         };
         match serde_json::from_value::<crate::openai::types::ChatCompletionResponse>(openai_resp) {
             Ok(parsed) => {
-                let anthropic_resp = convert_non_stream_response(&parsed, &model, &msg_id);
+                let upstream_model = &openai_req.model;
+                let (reasoning_field, reasoning_field_alt) = get_reasoning_fields(upstream_model, &config);
+                let anthropic_resp = convert_non_stream_response(&parsed, &model, &msg_id, &reasoning_field, &reasoning_field_alt);
                 (StatusCode::OK, Json(anthropic_resp)).into_response()
             }
             Err(e) => {

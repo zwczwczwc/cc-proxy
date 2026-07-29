@@ -11,6 +11,8 @@ pub fn convert_non_stream_response(
     openai_resp: &ChatCompletionResponse,
     model: &str,
     msg_id: &str,
+    reasoning_field: &str,
+    reasoning_field_alt: &[String],
 ) -> MessagesResponse {
     let choice = openai_resp.choices.first();
     let message = choice.and_then(|c| c.message.as_ref());
@@ -18,9 +20,8 @@ pub fn convert_non_stream_response(
     let mut content: Vec<ResponseContentBlock> = Vec::new();
 
     if let Some(msg) = message {
-        // 1. Thinking block (from reasoning_content or reasoning)
-        // kimi-k3 uses "reasoning" field, DeepSeek uses "reasoning_content"
-        let reasoning = msg.reasoning_content.as_ref().or(msg.reasoning.as_ref());
+        // 1. Thinking block — use ProviderConfig.reasoning_field to select the field
+        let reasoning = msg.get_reasoning(reasoning_field, reasoning_field_alt);
         if let Some(ref rc) = reasoning {
             if !rc.trim().is_empty() {
                 content.push(ResponseContentBlock::Thinking {
@@ -99,6 +100,10 @@ pub struct SseStateMachine {
     thinking_started: bool,
     tool_indices: std::collections::HashMap<u32, u32>,
     is_reasoning_model: bool,
+    /// Primary field name for reasoning content (from ProviderConfig.reasoning_field)
+    reasoning_field: String,
+    /// Alternative field names to try if primary is empty/missing
+    reasoning_field_alt: Vec<String>,
     /// Accumulated text for current text block
     current_text: String,
     /// Accumulated thinking for current thinking block
@@ -114,13 +119,15 @@ pub struct SseStateMachine {
 }
 
 impl SseStateMachine {
-    pub fn new(is_reasoning_model: bool) -> Self {
+    pub fn new(is_reasoning_model: bool, reasoning_field: String, reasoning_field_alt: Vec<String>) -> Self {
         Self {
             content_index: 0,
             text_started: false,
             thinking_started: false,
             tool_indices: std::collections::HashMap::new(),
             is_reasoning_model,
+            reasoning_field,
+            reasoning_field_alt,
             current_text: String::new(),
             current_thinking: String::new(),
             tool_names: std::collections::HashMap::new(),
@@ -139,8 +146,7 @@ impl SseStateMachine {
         let mut events = Vec::new();
 
         // Handle usage-only chunks (no choices/delta)
-        // kimi-k3 uses "reasoning" field, DeepSeek uses "reasoning_content"
-        let has_reasoning = delta.reasoning_content.is_some() || delta.reasoning.is_some();
+        let has_reasoning = delta.get_reasoning(&self.reasoning_field, &self.reasoning_field_alt).is_some();
         if !has_reasoning
             && delta.content.is_none()
             && delta.tool_calls.is_none()
@@ -152,8 +158,8 @@ impl SseStateMachine {
             return events;
         }
 
-        // 1. Process reasoning_content (DeepSeek) or reasoning (kimi)
-        let reasoning_delta = delta.reasoning_content.as_ref().or(delta.reasoning.as_ref());
+        // 1. Process reasoning — use ProviderConfig.reasoning_field to select the field
+        let reasoning_delta = delta.get_reasoning(&self.reasoning_field, &self.reasoning_field_alt);
         if let Some(ref rc) = reasoning_delta {
             if !rc.is_empty() && self.is_reasoning_model {
                 if !self.thinking_started {
@@ -405,6 +411,7 @@ mod tests {
                     content: Some("answer".to_string()),
                     reasoning_content: Some("let me think".to_string()),
                     reasoning: None,
+                    reasoning_details: None,
                     tool_calls: None,
                 }),
                 delta: None,
@@ -420,7 +427,7 @@ mod tests {
             }),
         };
 
-        let result = convert_non_stream_response(&openai_resp, "deepseek-v4", "msg_123");
+        let result = convert_non_stream_response(&openai_resp, "deepseek-v4", "msg_123", "reasoning_content", &[]);
         assert_eq!(result.content.len(), 2);
         assert!(matches!(result.content[0], ResponseContentBlock::Thinking { .. }));
         assert!(matches!(result.content[1], ResponseContentBlock::Text { .. }));

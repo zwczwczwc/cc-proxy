@@ -42,6 +42,8 @@ impl Stream for SseEventStream {
 pub fn process_stream(
     model: String,
     is_reasoning_model: bool,
+    reasoning_field: String,
+    reasoning_field_alt: Vec<String>,
     msg_id: String,
     mut body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
@@ -56,7 +58,7 @@ pub fn process_stream(
     );
 
     tokio::spawn(async move {
-        let mut state_machine = SseStateMachine::new(is_reasoning_model);
+        let mut state_machine = SseStateMachine::new(is_reasoning_model, reasoning_field, reasoning_field_alt);
 
         // Send message_start first (audit defect 3.1)
         let msg_start = state_machine.message_start(&model, &msg_id);

@@ -80,7 +80,41 @@ pub struct ChatMessage {
     /// kimi-k3 uses "reasoning" instead of "reasoning_content"
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Some providers use "reasoning_details" (fireworks alt field)
+    #[serde(default)]
+    pub reasoning_details: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
+}
+
+impl ChatMessage {
+    /// Extract reasoning content using the configured field name.
+    /// Tries primary field first, then alt fields, then returns None.
+    pub fn get_reasoning(&self, field: &str, alt_fields: &[String]) -> Option<&str> {
+        // Try primary field
+        if let Some(val) = self.field_value(field) {
+            if !val.trim().is_empty() {
+                return Some(val);
+            }
+        }
+        // Try alt fields
+        for alt in alt_fields {
+            if let Some(val) = self.field_value(alt) {
+                if !val.trim().is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+
+    fn field_value(&self, field: &str) -> Option<&str> {
+        match field {
+            "reasoning_content" => self.reasoning_content.as_deref(),
+            "reasoning" => self.reasoning.as_deref(),
+            "reasoning_details" => self.reasoning_details.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -91,7 +125,41 @@ pub struct ChatDelta {
     /// kimi-k3 uses "reasoning" instead of "reasoning_content"
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Some providers use "reasoning_details" (fireworks alt field)
+    #[serde(default)]
+    pub reasoning_details: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
+}
+
+impl ChatDelta {
+    /// Extract reasoning content using the configured field name.
+    /// Tries primary field first, then alt fields, then returns None.
+    pub fn get_reasoning(&self, field: &str, alt_fields: &[String]) -> Option<&str> {
+        // Try primary field
+        if let Some(val) = self.field_value(field) {
+            if !val.trim().is_empty() {
+                return Some(val);
+            }
+        }
+        // Try alt fields
+        for alt in alt_fields {
+            if let Some(val) = self.field_value(alt) {
+                if !val.trim().is_empty() {
+                    return Some(val);
+                }
+            }
+        }
+        None
+    }
+
+    fn field_value(&self, field: &str) -> Option<&str> {
+        match field {
+            "reasoning_content" => self.reasoning_content.as_deref(),
+            "reasoning" => self.reasoning.as_deref(),
+            "reasoning_details" => self.reasoning_details.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
@@ -149,6 +217,99 @@ pub struct PromptTokensDetails {
 #[derive(Debug, Clone, Serialize)]
 pub struct ModelListResponse {
     pub data: Vec<ModelInfo>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_get_reasoning_primary_field() {
+        // kimi uses "reasoning" as primary field
+        let msg = ChatMessage {
+            role: Some("assistant".to_string()),
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            reasoning: Some("kimi thinking".to_string()),
+            reasoning_details: None,
+            tool_calls: None,
+        };
+        let result = msg.get_reasoning("reasoning", &[]);
+        assert_eq!(result, Some("kimi thinking"));
+    }
+
+    #[test]
+    fn test_get_reasoning_deepseek() {
+        // DeepSeek uses "reasoning_content" as primary field
+        let msg = ChatMessage {
+            role: Some("assistant".to_string()),
+            content: Some("answer".to_string()),
+            reasoning_content: Some("deepseek thinking".to_string()),
+            reasoning: None,
+            reasoning_details: None,
+            tool_calls: None,
+        };
+        let result = msg.get_reasoning("reasoning_content", &[]);
+        assert_eq!(result, Some("deepseek thinking"));
+    }
+
+    #[test]
+    fn test_get_reasoning_fallback_to_alt() {
+        // Primary field is empty/missing, fall back to alt field
+        let msg = ChatMessage {
+            role: Some("assistant".to_string()),
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: Some("details thinking".to_string()),
+            tool_calls: None,
+        };
+        let result = msg.get_reasoning("reasoning", &["reasoning_details".to_string()]);
+        assert_eq!(result, Some("details thinking"));
+    }
+
+    #[test]
+    fn test_get_reasoning_empty_primary_uses_alt() {
+        // Primary field is empty string, should fall back to alt
+        let msg = ChatMessage {
+            role: Some("assistant".to_string()),
+            content: Some("answer".to_string()),
+            reasoning_content: Some("  ".to_string()), // whitespace only = empty
+            reasoning: Some("alt thinking".to_string()),
+            reasoning_details: None,
+            tool_calls: None,
+        };
+        let result = msg.get_reasoning("reasoning_content", &["reasoning".to_string()]);
+        assert_eq!(result, Some("alt thinking"));
+    }
+
+    #[test]
+    fn test_get_reasoning_none() {
+        let msg = ChatMessage {
+            role: Some("assistant".to_string()),
+            content: Some("answer".to_string()),
+            reasoning_content: None,
+            reasoning: None,
+            reasoning_details: None,
+            tool_calls: None,
+        };
+        let result = msg.get_reasoning("reasoning_content", &["reasoning".to_string()]);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_chat_delta_get_reasoning() {
+        let delta = ChatDelta {
+            role: None,
+            content: None,
+            reasoning_content: None,
+            reasoning: Some("stream thinking".to_string()),
+            reasoning_details: None,
+            tool_calls: None,
+        };
+        let result = delta.get_reasoning("reasoning", &[]);
+        assert_eq!(result, Some("stream thinking"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
