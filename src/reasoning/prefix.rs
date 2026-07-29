@@ -1,4 +1,4 @@
-// Copyright (c) 2025 codewhale-proxy
+// Copyright (c) 2025 cc-proxy
 // Ported from CodeWhale prefix_cache.rs (534 lines)
 // Reference: https://github.com/Hmbown/CodeWhale
 //

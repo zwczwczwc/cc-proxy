@@ -24,7 +24,7 @@ async fn main() -> anyhow::Result<()> {
 
     let config = Arc::new(config::Config::from_env());
 
-    tracing::info!("codewhale-proxy v0.1.0 starting");
+    tracing::info!("cc-proxy v0.2.0 starting");
     tracing::info!("Listening on: {}", config.listen_addr);
     tracing::info!("eswitch URL: {}", config.eswitch_url);
     tracing::info!("Default model: {}", config.default_model);

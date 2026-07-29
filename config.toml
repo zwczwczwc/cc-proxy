@@ -1,5 +1,5 @@
-# codewhale-proxy model mapping configuration
-# This file is loaded at /etc/codewhale-proxy/config.toml inside the container.
+# cc-proxy model mapping configuration
+# This file is loaded at /etc/cc-proxy/config.toml inside the container.
 # Outside containers, set MODEL_CONFIG_PATH env var to point to this file.
 
 [models]

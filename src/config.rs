@@ -252,7 +252,7 @@ impl Config {
 
     /// Load model config from file with priority:
     /// 1. Env var MODEL_CONFIG_PATH
-    /// 2. /etc/codewhale-proxy/config.toml
+    /// 2. /etc/cc-proxy/config.toml
     /// 3. Built-in hardcoded defaults
     fn load_model_config() -> (
         HashMap<String, String>,
@@ -264,7 +264,7 @@ impl Config {
             .ok()
             .map(PathBuf::from)
             .or_else(|| {
-                let etc = PathBuf::from("/etc/codewhale-proxy/config.toml");
+                let etc = PathBuf::from("/etc/cc-proxy/config.toml");
                 if etc.exists() {
                     Some(etc)
                 } else {

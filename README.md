@@ -1,4 +1,4 @@
-# codewhale-proxy
+# cc-proxy
 
 Anthropic Messages API → DeepSeek Chat Completions API proxy. Converts Claude Code's traffic into DeepSeek-compatible requests with full thinking/reasoning/KV-cache support.
 
@@ -8,7 +8,7 @@ Anthropic Messages API → DeepSeek Chat Completions API proxy. Converts Claude 
 Claude Code                          DeepSeek API
 (Anthropic /v1/messages)  ──►  (OpenAI /v1/chat/completions)
         │                                  │
-        └──── codewhale-proxy ─────────────┘
+        └──── cc-proxy ─────────────┘
              127.0.0.1:11435
 ```
 
@@ -37,7 +37,7 @@ LISTEN_ADDR=127.0.0.1:11435 \
 DEEPSEEK_BASE_URL=http://127.0.0.1:11434/v1 \
 DEEPSEEK_API_KEY=not-needed \
 RUST_LOG=info \
-./target/release/codewhale-proxy
+./target/release/cc-proxy
 ```
 
 ### Environment Variables

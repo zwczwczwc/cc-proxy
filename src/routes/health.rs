@@ -7,6 +7,6 @@ pub fn routes() -> Router {
 async fn handle_health() -> Json<serde_json::Value> {
     Json(serde_json::json!({
         "status": "ok",
-        "service": "codewhale-proxy"
+        "service": "cc-proxy"
     }))
 }

@@ -1,4 +1,4 @@
-// Copyright (c) 2025 codewhale-proxy
+// Copyright (c) 2025 cc-proxy
 // Ported from permafrost permafrost_align.py L47-L310
 // Reference: https://github.com/jianzhichun/permafrost
 //
@@ -102,7 +102,7 @@ pub fn stabilize_metadata(mut system: SystemPrompt) -> SystemPrompt {
     let mut count = 0;
     for block in blocks.iter_mut() {
         if block.text.contains(BILLING_MARKER) {
-            let new_text = re_cch().replace(&block.text, "${1}codewhale-proxy").to_string();
+            let new_text = re_cch().replace(&block.text, "${1}cc-proxy").to_string();
             if new_text != block.text {
                 block.text = new_text;
                 count += 1;
