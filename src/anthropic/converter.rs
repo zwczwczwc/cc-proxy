@@ -291,7 +291,7 @@ mod tests {
             "fireworks".to_string(),
             ProviderConfig {
                 reasoning_field: "reasoning".to_string(),
-                reasoning_field_alt: vec!["reasoning_details".to_string()],
+                reasoning_field_alt: vec![],
                 thinking_param: None,
                 thinking_type_enabled: None,
                 thinking_type_disabled: None,

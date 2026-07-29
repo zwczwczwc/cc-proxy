@@ -411,7 +411,6 @@ mod tests {
                     content: Some("answer".to_string()),
                     reasoning_content: Some("let me think".to_string()),
                     reasoning: None,
-                    reasoning_details: None,
                     tool_calls: None,
                 }),
                 delta: None,

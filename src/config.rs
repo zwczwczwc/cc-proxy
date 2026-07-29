@@ -402,7 +402,7 @@ impl Config {
             "fireworks".to_string(),
             ProviderConfig {
                 reasoning_field: "reasoning".to_string(),
-                reasoning_field_alt: vec!["reasoning_details".to_string()],
+                reasoning_field_alt: vec![],
                 thinking_param: None,
                 thinking_type_enabled: None,
                 thinking_type_disabled: None,
@@ -490,7 +490,6 @@ max = "max"
 
 [providers.fireworks]
 reasoning_field = "reasoning"
-reasoning_field_alt = ["reasoning_details"]
 disable_thinking = true
 effort_param = "reasoning_effort"
 
@@ -531,7 +530,7 @@ aliases = []
 
         let fw = &providers["fireworks"];
         assert_eq!(fw.reasoning_field, "reasoning");
-        assert_eq!(fw.reasoning_field_alt, vec!["reasoning_details".to_string()]);
+        assert_eq!(fw.reasoning_field_alt, Vec::<String>::new());
         assert!(fw.disable_thinking);
         assert!(fw.thinking_param.is_none());
 
@@ -597,7 +596,6 @@ aliases = []
         let toml_str = r#"
 [providers.fireworks]
 reasoning_field = "reasoning"
-reasoning_field_alt = ["reasoning_details"]
 disable_thinking = true
 effort_param = "reasoning_effort"
 

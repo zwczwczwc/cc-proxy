@@ -80,9 +80,6 @@ pub struct ChatMessage {
     /// kimi-k3 uses "reasoning" instead of "reasoning_content"
     #[serde(default)]
     pub reasoning: Option<String>,
-    /// Some providers use "reasoning_details" (fireworks alt field)
-    #[serde(default)]
-    pub reasoning_details: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -111,7 +108,6 @@ impl ChatMessage {
         match field {
             "reasoning_content" => self.reasoning_content.as_deref(),
             "reasoning" => self.reasoning.as_deref(),
-            "reasoning_details" => self.reasoning_details.as_deref(),
             _ => None,
         }
     }
@@ -125,9 +121,6 @@ pub struct ChatDelta {
     /// kimi-k3 uses "reasoning" instead of "reasoning_content"
     #[serde(default)]
     pub reasoning: Option<String>,
-    /// Some providers use "reasoning_details" (fireworks alt field)
-    #[serde(default)]
-    pub reasoning_details: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 
@@ -156,7 +149,6 @@ impl ChatDelta {
         match field {
             "reasoning_content" => self.reasoning_content.as_deref(),
             "reasoning" => self.reasoning.as_deref(),
-            "reasoning_details" => self.reasoning_details.as_deref(),
             _ => None,
         }
     }
@@ -231,8 +223,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: None,
             reasoning: Some("kimi thinking".to_string()),
-            reasoning_details: None,
-            tool_calls: None,
+                        tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning", &[]);
         assert_eq!(result, Some("kimi thinking"));
@@ -246,26 +237,10 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: Some("deepseek thinking".to_string()),
             reasoning: None,
-            reasoning_details: None,
-            tool_calls: None,
+                        tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning_content", &[]);
         assert_eq!(result, Some("deepseek thinking"));
-    }
-
-    #[test]
-    fn test_get_reasoning_fallback_to_alt() {
-        // Primary field is empty/missing, fall back to alt field
-        let msg = ChatMessage {
-            role: Some("assistant".to_string()),
-            content: Some("answer".to_string()),
-            reasoning_content: None,
-            reasoning: None,
-            reasoning_details: Some("details thinking".to_string()),
-            tool_calls: None,
-        };
-        let result = msg.get_reasoning("reasoning", &["reasoning_details".to_string()]);
-        assert_eq!(result, Some("details thinking"));
     }
 
     #[test]
@@ -276,8 +251,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: Some("  ".to_string()), // whitespace only = empty
             reasoning: Some("alt thinking".to_string()),
-            reasoning_details: None,
-            tool_calls: None,
+                        tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning_content", &["reasoning".to_string()]);
         assert_eq!(result, Some("alt thinking"));
@@ -290,8 +264,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: None,
             reasoning: None,
-            reasoning_details: None,
-            tool_calls: None,
+                        tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning_content", &["reasoning".to_string()]);
         assert_eq!(result, None);
@@ -304,8 +277,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             reasoning: Some("stream thinking".to_string()),
-            reasoning_details: None,
-            tool_calls: None,
+                        tool_calls: None,
         };
         let result = delta.get_reasoning("reasoning", &[]);
         assert_eq!(result, Some("stream thinking"));
