@@ -85,6 +85,7 @@ impl Config {
         mapping.insert("claude-opus-4-5".to_string(), "deepseek-v4-pro".to_string());
         mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
         // Claude Sonnet variants → v4-flash (cost-effective for most tasks)
+        mapping.insert("claude-sonnet-4-7".to_string(), "kimi-k3".to_string());
         mapping.insert("claude-sonnet-4-6".to_string(), "deepseek-v4-flash".to_string());
         mapping.insert("claude-sonnet-4-5".to_string(), "deepseek-v4-flash".to_string());
         mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-flash".to_string());

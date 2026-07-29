@@ -3,6 +3,11 @@
 pub fn requires_reasoning_content(model: &str) -> bool {
     let model_lower = model.to_lowercase();
 
+    // Kimi K3 series — always has reasoning enabled
+    if model_lower.starts_with("kimi-") {
+        return true;
+    }
+
     // DeepSeek V4 series
     if model_lower.starts_with("deepseek-v4") {
         return true;
@@ -81,5 +86,12 @@ mod tests {
         assert!(requires_reasoning_content("some-reasoner-model"));
         assert!(requires_reasoning_content("model-with-reasoning"));
         assert!(requires_reasoning_content("model-with-thinking"));
+    }
+
+    #[test]
+    fn test_kimi_models() {
+        assert!(requires_reasoning_content("kimi-k3"));
+        assert!(requires_reasoning_content("kimi-k3-pro"));
+        assert!(requires_reasoning_content("kimi-k3-flash"));
     }
 }

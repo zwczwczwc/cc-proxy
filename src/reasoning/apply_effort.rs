@@ -13,7 +13,13 @@ pub fn apply_reasoning_effort(body: &mut Value, effort: Option<&str>, provider: 
     match effort {
         "off" | "disabled" | "none" | "false" => {
             // Disable thinking
-            if provider == "deepseek" || provider == "openrouter" {
+            if provider == "kimi" {
+                // K3 cannot turn off thinking; set to lowest effort
+                body["reasoning_effort"] = serde_json::json!("low");
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("thinking");
+                }
+            } else if provider == "deepseek" || provider == "openrouter" {
                 body["thinking"] = serde_json::json!({"type": "disabled"});
             }
             // Remove any existing reasoning_effort
@@ -22,7 +28,13 @@ pub fn apply_reasoning_effort(body: &mut Value, effort: Option<&str>, provider: 
             }
         }
         "low" | "medium" | "high" => {
-            if provider == "deepseek" {
+            if provider == "kimi" {
+                body["reasoning_effort"] = serde_json::json!(effort);
+                // Do NOT set thinking.type — K3 doesn't support it
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("thinking");
+                }
+            } else if provider == "deepseek" {
                 body["reasoning_effort"] = serde_json::json!("high");
                 body["thinking"] = serde_json::json!({"type": "enabled"});
             } else if provider == "openrouter" {
@@ -31,7 +43,12 @@ pub fn apply_reasoning_effort(body: &mut Value, effort: Option<&str>, provider: 
             }
         }
         "max" | "xhigh" => {
-            if provider == "deepseek" {
+            if provider == "kimi" {
+                body["reasoning_effort"] = serde_json::json!("max");
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("thinking");
+                }
+            } else if provider == "deepseek" {
                 body["reasoning_effort"] = serde_json::json!("max");
                 body["thinking"] = serde_json::json!({"type": "enabled"});
             } else if provider == "openrouter" {
@@ -41,7 +58,12 @@ pub fn apply_reasoning_effort(body: &mut Value, effort: Option<&str>, provider: 
         }
         _ => {
             // Unknown effort level, treat as enabled with high
-            if provider == "deepseek" {
+            if provider == "kimi" {
+                body["reasoning_effort"] = serde_json::json!("high");
+                if let Some(obj) = body.as_object_mut() {
+                    obj.remove("thinking");
+                }
+            } else if provider == "deepseek" {
                 body["reasoning_effort"] = serde_json::json!("high");
                 body["thinking"] = serde_json::json!({"type": "enabled"});
             }

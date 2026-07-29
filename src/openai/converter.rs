@@ -18,11 +18,13 @@ pub fn convert_non_stream_response(
     let mut content: Vec<ResponseContentBlock> = Vec::new();
 
     if let Some(msg) = message {
-        // 1. Thinking block (from reasoning_content)
-        if let Some(ref rc) = msg.reasoning_content {
+        // 1. Thinking block (from reasoning_content or reasoning)
+        // kimi-k3 uses "reasoning" field, DeepSeek uses "reasoning_content"
+        let reasoning = msg.reasoning_content.as_ref().or(msg.reasoning.as_ref());
+        if let Some(ref rc) = reasoning {
             if !rc.trim().is_empty() {
                 content.push(ResponseContentBlock::Thinking {
-                    thinking: rc.clone(),
+                    thinking: rc.to_string(),
                     signature: "sig_proxy_placeholder".to_string(),
                 });
             }
@@ -137,7 +139,9 @@ impl SseStateMachine {
         let mut events = Vec::new();
 
         // Handle usage-only chunks (no choices/delta)
-        if delta.reasoning_content.is_none()
+        // kimi-k3 uses "reasoning" field, DeepSeek uses "reasoning_content"
+        let has_reasoning = delta.reasoning_content.is_some() || delta.reasoning.is_some();
+        if !has_reasoning
             && delta.content.is_none()
             && delta.tool_calls.is_none()
             && delta.role.is_none()
@@ -148,8 +152,9 @@ impl SseStateMachine {
             return events;
         }
 
-        // 1. Process reasoning_content
-        if let Some(ref rc) = delta.reasoning_content {
+        // 1. Process reasoning_content (DeepSeek) or reasoning (kimi)
+        let reasoning_delta = delta.reasoning_content.as_ref().or(delta.reasoning.as_ref());
+        if let Some(ref rc) = reasoning_delta {
             if !rc.is_empty() && self.is_reasoning_model {
                 if !self.thinking_started {
                     // Close any open text block first
@@ -175,7 +180,7 @@ impl SseStateMachine {
                 events.push(SseEvent::ContentBlockDelta {
                     index: self.content_index,
                     delta: ContentBlockDeltaData::ThinkingDelta {
-                        thinking: rc.clone(),
+                        thinking: rc.to_string(),
                     },
                 });
             }
@@ -399,6 +404,7 @@ mod tests {
                     role: Some("assistant".to_string()),
                     content: Some("answer".to_string()),
                     reasoning_content: Some("let me think".to_string()),
+                    reasoning: None,
                     tool_calls: None,
                 }),
                 delta: None,

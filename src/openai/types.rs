@@ -77,6 +77,9 @@ pub struct ChatMessage {
     pub role: Option<String>,
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
+    /// kimi-k3 uses "reasoning" instead of "reasoning_content"
+    #[serde(default)]
+    pub reasoning: Option<String>,
     pub tool_calls: Option<Vec<ToolCall>>,
 }
 
@@ -85,6 +88,9 @@ pub struct ChatDelta {
     pub role: Option<String>,
     pub content: Option<String>,
     pub reasoning_content: Option<String>,
+    /// kimi-k3 uses "reasoning" instead of "reasoning_content"
+    #[serde(default)]
+    pub reasoning: Option<String>,
     pub tool_calls: Option<Vec<ToolCallDelta>>,
 }
 

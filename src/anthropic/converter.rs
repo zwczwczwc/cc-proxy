@@ -166,6 +166,29 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
 }
 
 fn apply_effort_direct(req: &mut ChatCompletionRequest, effort: &str) {
+    // TODO(Phase 2): Make kimi detection config-driven instead of hardcoded prefix
+    let is_kimi = req.model.starts_with("kimi-");
+
+    if is_kimi {
+        // Kimi K3: no thinking.type support, reasoning_effort passthrough
+        match effort {
+            "off" | "disabled" | "none" | "false" => {
+                // K3 cannot turn off thinking; set to lowest effort
+                req.reasoning_effort = Some("low".to_string());
+            }
+            "low" | "medium" | "high" | "max" | "xhigh" => {
+                // xhigh → max (K3 ceiling), all others passthrough
+                let mapped = if effort == "xhigh" { "max" } else { effort };
+                req.reasoning_effort = Some(mapped.to_string());
+            }
+            _ => {
+                req.reasoning_effort = Some("high".to_string());
+            }
+        }
+        // Do NOT set req.thinking — K3 doesn't support thinking.type
+        return;
+    }
+
     match effort {
         "off" | "disabled" | "none" | "false" => {
             req.thinking = Some(crate::openai::types::DeepSeekThinking {
