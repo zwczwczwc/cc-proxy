@@ -1,54 +1,31 @@
-use axum::{Json, Router, routing::get};
+use axum::{Json, Router, extract::State, routing::get};
+use std::sync::Arc;
+use crate::config::Config;
 
-pub fn routes() -> Router {
-    Router::new().route("/v1/models", get(handle_models))
+pub fn routes(config: Arc<Config>) -> Router {
+    Router::new()
+        .route("/v1/models", get(handle_models))
+        .with_state(config)
 }
 
-async fn handle_models() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "data": [
-            {
-                "id": "deepseek-v4-pro",
+async fn handle_models(State(config): State<Arc<Config>>) -> Json<serde_json::Value> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+
+    let data: Vec<serde_json::Value> = config
+        .model_profiles
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "id": p.name,
                 "object": "model",
-                "created": 1725148800,
-                "owned_by": "deepseek"
-            },
-            {
-                "id": "deepseek-v4-flash",
-                "object": "model",
-                "created": 1725148800,
-                "owned_by": "deepseek"
-            },
-            {
-                "id": "deepseek-v4",
-                "object": "model",
-                "created": 1725148800,
-                "owned_by": "deepseek"
-            },
-            {
-                "id": "deepseek-chat",
-                "object": "model",
-                "created": 1725148800,
-                "owned_by": "deepseek"
-            },
-            {
-                "id": "deepseek-reasoner",
-                "object": "model",
-                "created": 1725148800,
-                "owned_by": "deepseek"
-            },
-            {
-                "id": "kimi-k3",
-                "object": "model",
-                "created": 1725148800,
-                "owned_by": "moonshotai"
-            },
-            {
-                "id": "glm-5.2",
-                "object": "model",
-                "created": 1725148800,
-                "owned_by": "zhipuai"
-            }
-        ]
-    }))
+                "created": now,
+                "owned_by": p.provider,
+            })
+        })
+        .collect();
+
+    Json(serde_json::json!({ "data": data }))
 }

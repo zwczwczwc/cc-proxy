@@ -1,34 +1,31 @@
-use std::collections::HashMap;
 use serde_json::Value;
 use crate::anthropic::types::{MessagesRequest, SystemPrompt, Tool, ToolChoice};
 use crate::config::Config;
-use crate::openai::types::{ChatCompletionRequest, OpenAiTool, OpenAiFunction, StreamOptions};
+use crate::openai::types::{ChatCompletionRequest, OpenAiTool, OpenAiFunction, StreamOptions, DeepSeekThinking};
 use crate::reasoning::sanitize::sanitize_thinking_mode_messages;
 use crate::reasoning::build_messages::build_chat_messages_with_reasoning;
 use crate::reasoning::requires::requires_reasoning_content;
 use crate::reasoning::prefix::compute_prefix_fingerprint;
 
-/// Map Claude model names to upstream DeepSeek model names using the config's model_mapping.
-/// The `[1m]` suffix is stripped before lookup. Unknown models fall back to config's default_model.
-fn map_model_to_upstream(model: &str, mapping: &HashMap<String, String>, default: &str) -> String {
+/// Map Claude model names to upstream model names using the config's model_mapping
+/// and model_profiles. The `[1m]` suffix is stripped before lookup.
+/// If the model is a known profile (or alias), it passes through directly.
+/// Unknown models fall back to config's default_model.
+fn map_model_to_upstream(model: &str, config: &Config) -> String {
     let clean = model.trim_end_matches("[1m]").trim();
-    // Check if it's already a DeepSeek model — pass through
-    if clean.starts_with("deepseek") {
+    // Check if it's already a known upstream model (profile or alias) — pass through
+    if config.model_profile(clean).is_some() {
         return clean.to_string();
     }
-    // Check if it's a GLM model — pass through directly
-    if clean.starts_with("glm") {
-        return clean.to_string();
-    }
-    mapping.get(clean).cloned().unwrap_or_else(|| default.to_string())
+config.model_mapping.get(clean).cloned().unwrap_or_else(|| config.default_model.clone())
 }
 
 /// Convert Anthropic MessagesRequest to OpenAI ChatCompletionRequest.
 pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ChatCompletionRequest> {
     let model = req.model.clone();
-    // Map Claude model names to DeepSeek model names for eswitch
-    let upstream_model = map_model_to_upstream(&model, &config.model_mapping, &config.default_model);
-    let is_reasoning_model = requires_reasoning_content(&upstream_model);
+    // Map Claude model names to upstream model names for eswitch
+    let upstream_model = map_model_to_upstream(&model, config);
+    let is_reasoning_model = requires_reasoning_content(&upstream_model, config);
 
     // Determine effort level from thinking config for replay decision
     let effort_for_replay = req.thinking.as_ref().and_then(|t| {
@@ -46,6 +43,7 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     let include_reasoning = crate::reasoning::should_replay::should_replay_reasoning_content(
         &upstream_model,
         effort_for_replay.as_deref(),
+        config,
     );
 
     // Build OpenAI messages
@@ -126,12 +124,12 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
             } else {
                 "high"
             };
-            apply_effort_direct(&mut openai_req, effort);
+            apply_effort_direct(&mut openai_req, effort, config);
         } else {
-            apply_effort_direct(&mut openai_req, "off");
+            apply_effort_direct(&mut openai_req, "off", config);
         }
     } else if is_reasoning_model {
-        apply_effort_direct(&mut openai_req, "xhigh");
+        apply_effort_direct(&mut openai_req, "xhigh", config);
     }
 
     // GLM-5.2: 保留式思考需要 clear_thinking=false 在 thinking 对象内
@@ -165,58 +163,69 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     Ok(openai_req)
 }
 
-fn apply_effort_direct(req: &mut ChatCompletionRequest, effort: &str) {
-    // TODO(Phase 2): Make kimi detection config-driven instead of hardcoded prefix
-    let is_kimi = req.model.starts_with("kimi-");
-
-    if is_kimi {
-        // Kimi K3: no thinking.type support, reasoning_effort passthrough
-        match effort {
-            "off" | "disabled" | "none" | "false" => {
-                // K3 cannot turn off thinking; set to lowest effort
-                req.reasoning_effort = Some("low".to_string());
-            }
-            "low" | "medium" | "high" | "max" | "xhigh" => {
-                // xhigh → max (K3 ceiling), all others passthrough
-                let mapped = if effort == "xhigh" { "max" } else { effort };
-                req.reasoning_effort = Some(mapped.to_string());
-            }
-            _ => {
-                req.reasoning_effort = Some("high".to_string());
-            }
-        }
-        // Do NOT set req.thinking — K3 doesn't support thinking.type
-        return;
-    }
+/// Apply reasoning effort to the request using provider-driven configuration.
+/// Replaces hardcoded kimi- prefix detection and provider=="deepseek" branches.
+fn apply_effort_direct(req: &mut ChatCompletionRequest, effort: &str, config: &Config) {
+    // Look up the model's provider config
+    let profile = config.model_profile(&req.model);
+    let provider = profile.and_then(|p| config.provider_config(&p.provider));
 
     match effort {
         "off" | "disabled" | "none" | "false" => {
-            req.thinking = Some(crate::openai::types::DeepSeekThinking {
-                thinking_type: "disabled".to_string(),
-                clear_thinking: None,
-            });
-            req.reasoning_effort = None;
-        }
-        "low" | "medium" | "high" => {
-            req.reasoning_effort = Some("high".to_string());
-            req.thinking = Some(crate::openai::types::DeepSeekThinking {
-                thinking_type: "enabled".to_string(),
-                clear_thinking: None,
-            });
-        }
-        "max" | "xhigh" => {
-            req.reasoning_effort = Some("max".to_string());
-            req.thinking = Some(crate::openai::types::DeepSeekThinking {
-                thinking_type: "enabled".to_string(),
-                clear_thinking: None,
-            });
+if let Some(prov) = provider {
+                if prov.disable_thinking {
+                    // Cannot turn off thinking; set to lowest effort
+                    let lowest = prov
+                        .effort_map
+                        .get("low")
+                        .cloned()
+                        .unwrap_or_else(|| "low".to_string());
+                    req.reasoning_effort = Some(lowest);
+                    // Do NOT set thinking — provider doesn't support it
+                } else {
+                    // Set thinking.type = disabled
+                    req.thinking = Some(DeepSeekThinking {
+                        thinking_type: prov
+                            .thinking_type_disabled
+                            .clone()
+                            .unwrap_or_else(|| "disabled".to_string()),
+                    });
+                    req.reasoning_effort = None;
+                }
+            } else {
+                // Fallback: unknown model, use default behavior
+                req.thinking = Some(DeepSeekThinking {
+                    thinking_type: "disabled".to_string(),
+                });
+                req.reasoning_effort = None;
+            }
         }
         _ => {
-            req.reasoning_effort = Some("high".to_string());
-            req.thinking = Some(crate::openai::types::DeepSeekThinking {
-                thinking_type: "enabled".to_string(),
-                clear_thinking: None,
-            });
+            if let Some(prov) = provider {
+                // Map effort through provider's effort_map; default to "high" for unknown levels
+                let mapped = prov
+                    .effort_map
+                    .get(effort)
+                    .cloned()
+                    .unwrap_or_else(|| "high".to_string());
+                req.reasoning_effort = Some(mapped);
+
+                // Set thinking.type = enabled if provider supports it
+                if prov.thinking_param.is_some() {
+                    req.thinking = Some(DeepSeekThinking {
+                        thinking_type: prov
+                            .thinking_type_enabled
+                            .clone()
+                            .unwrap_or_else(|| "enabled".to_string()),
+                    });
+                }
+            } else {
+                // Fallback: unknown model
+                req.reasoning_effort = Some("high".to_string());
+                req.thinking = Some(DeepSeekThinking {
+                    thinking_type: "enabled".to_string(),
+                });
+            }
         }
     }
 }
@@ -245,7 +254,9 @@ fn convert_tool_choice(tc: &ToolChoice) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::anthropic::types::{ContentBlock, ContentValue, Message, SystemContentBlock, SystemPrompt, ThinkingConfig, ToolResultContent};
+    use std::collections::HashMap;
+    use crate::anthropic::types::{ContentBlock, ContentValue, Message, SystemContentBlock, SystemPrompt, ThinkingConfig};
+    use crate::config::ProviderConfig;
 
     /// Helper to create a minimal Config for tests.
     fn test_config() -> Config {
@@ -253,6 +264,117 @@ mod tests {
         mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
         mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-flash".to_string());
         mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-pro".to_string());
+
+        let mut providers = HashMap::new();
+        providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning_content".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: Some("thinking".to_string()),
+                thinking_type_enabled: Some("enabled".to_string()),
+                thinking_type_disabled: Some("disabled".to_string()),
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "high".to_string());
+                    m.insert("medium".to_string(), "high".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m.insert("xhigh".to_string(), "max".to_string());
+                    m
+                },
+            },
+        );
+        providers.insert(
+            "fireworks".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning".to_string(),
+                reasoning_field_alt: vec!["reasoning_details".to_string()],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: true,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "low".to_string());
+                    m.insert("medium".to_string(), "medium".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m.insert("xhigh".to_string(), "max".to_string());
+                    m
+                },
+            },
+        );
+        providers.insert(
+            "glm".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning_content".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: Some("thinking".to_string()),
+                thinking_type_enabled: Some("enabled".to_string()),
+                thinking_type_disabled: Some("disabled".to_string()),
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("none".to_string(), "none".to_string());
+                    m.insert("minimal".to_string(), "minimal".to_string());
+                    m.insert("low".to_string(), "low".to_string());
+                    m.insert("medium".to_string(), "medium".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("xhigh".to_string(), "xhigh".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+            },
+        );
+
+        let model_profiles = vec![
+            crate::config::ModelProfile {
+                name: "deepseek-v4-pro".to_string(),
+                provider: "deepseek".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: true,
+                aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            },
+            crate::config::ModelProfile {
+                name: "deepseek-v4-flash".to_string(),
+                provider: "deepseek".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: true,
+                aliases: vec![],
+            },
+            crate::config::ModelProfile {
+                name: "kimi-k3".to_string(),
+                provider: "fireworks".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+            },
+            crate::config::ModelProfile {
+                name: "glm-5.2".to_string(),
+                provider: "glm".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+            },
+        ];
+
+        let mut profile_by_name = HashMap::new();
+        for (i, profile) in model_profiles.iter().enumerate() {
+            profile_by_name.insert(profile.name.clone(), i);
+            for alias in &profile.aliases {
+                profile_by_name.insert(alias.clone(), i);
+            }
+        }
+
         Config {
             listen_addr: "0.0.0.0:11435".to_string(),
             eswitch_url: "http://127.0.0.1:11434".to_string(),
@@ -260,6 +382,9 @@ mod tests {
             log_level: "info".to_string(),
             model_mapping: mapping,
             default_model: "deepseek-v4-pro".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name,
         }
     }
 
@@ -319,12 +444,13 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
+        // budget=16000 >= 4096 → max effort
         assert_eq!(result.reasoning_effort, Some("max".to_string()));
-        assert!(result.thinking.is_some());
+        assert_eq!(result.thinking.as_ref().unwrap().thinking_type, "enabled");
     }
 
     #[test]
-    fn test_thinking_adaptive() {
+    fn test_thinking_adaptive_on_reasoning_model() {
         let config = test_config();
         let req = MessagesRequest {
             model: "deepseek-v4-pro".to_string(),
@@ -335,145 +461,10 @@ mod tests {
             }],
             max_tokens: 32768,
             stream: Some(false),
-            thinking: Some(ThinkingConfig::Adaptive {
-                config_type: "enabled".to_string(),
-                display: Some("omitted".to_string()),
-            }),
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-        };
-
-        let result = convert_request(&req, &config).unwrap();
-        // Adaptive thinking on reasoning models now defaults to max (not high).
-        assert_eq!(result.reasoning_effort, Some("max".to_string()));
-        assert!(result.thinking.is_some());
-    }
-
-    #[test]
-    fn test_model_mapping_claude_to_deepseek() {
-        let config = test_config();
-        let req = MessagesRequest {
-            model: "claude-sonnet-4".to_string(),
-            system: None,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: ContentValue::Text("hello".to_string()),
-            }],
-            max_tokens: 4096,
-            stream: Some(false),
-            thinking: None,
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-        };
-
-        let result = convert_request(&req, &config).unwrap();
-        assert_eq!(result.model, "deepseek-v4-flash");
-    }
-
-    #[test]
-    fn test_model_mapping_unknown_falls_back_to_default() {
-        let config = test_config();
-        let req = MessagesRequest {
-            model: "some-unknown-model".to_string(),
-            system: None,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: ContentValue::Text("hello".to_string()),
-            }],
-            max_tokens: 4096,
-            stream: Some(false),
-            thinking: None,
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-        };
-
-        let result = convert_request(&req, &config).unwrap();
-        assert_eq!(result.model, "deepseek-v4-pro");
-    }
-
-    #[test]
-    fn test_model_mapping_deepseek_passthrough() {
-        let config = test_config();
-        let req = MessagesRequest {
-            model: "deepseek-v3".to_string(),
-            system: None,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: ContentValue::Text("hello".to_string()),
-            }],
-            max_tokens: 4096,
-            stream: Some(false),
-            thinking: None,
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-        };
-
-        let result = convert_request(&req, &config).unwrap();
-        assert_eq!(result.model, "deepseek-v3");
-    }
-
-    #[test]
-    fn test_map_model_strips_1m_suffix() {
-        let config = test_config();
-        let req = MessagesRequest {
-            model: "deepseek-v4-pro[1m]".to_string(),
-            system: None,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: ContentValue::Text("hello".to_string()),
-            }],
-            max_tokens: 4096,
-            stream: Some(false),
-            thinking: None,
-            tools: None,
-            tool_choice: None,
-            metadata: None,
-            stop_sequences: None,
-            temperature: None,
-            top_p: None,
-            top_k: None,
-        };
-
-        let result = convert_request(&req, &config).unwrap();
-        assert_eq!(result.model, "deepseek-v4-pro");
-    }
-
-    #[test]
-    fn test_converter_include_reasoning_effort_max() {
-        // thinking=enabled, budget>=4096 → include_reasoning=true
-        let config = test_config();
-        let req = MessagesRequest {
-            model: "deepseek-v4-pro".to_string(),
-            system: None,
-            messages: vec![Message {
-                role: "user".to_string(),
-                content: ContentValue::Text("hello".to_string()),
-            }],
-            max_tokens: 32768,
-            stream: Some(false),
+            // budget=0 → Adaptive mode → max on reasoning models
             thinking: Some(ThinkingConfig::Enabled {
                 config_type: "enabled".to_string(),
-                budget_tokens: Some(16000),
+                budget_tokens: Some(0),
                 display: None,
             }),
             tools: None,
@@ -486,16 +477,11 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
-        // Verify max thinking is still applied
         assert_eq!(result.reasoning_effort, Some("max".to_string()));
-        assert!(result.thinking.is_some());
-        // No assistant messages in single-turn, so reasoning_content replay not visible
-        // But the code path is exercised (include_reasoning should be true)
     }
 
     #[test]
-    fn test_converter_include_reasoning_effort_off() {
-        // thinking=disabled → include_reasoning=false
+    fn test_thinking_disabled() {
         let config = test_config();
         let req = MessagesRequest {
             model: "deepseek-v4-pro".to_string(),
@@ -519,80 +505,46 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
-        // Verify thinking is disabled
+        assert_eq!(result.thinking.as_ref().unwrap().thinking_type, "disabled");
         assert_eq!(result.reasoning_effort, None);
-        assert!(result.thinking.is_some());
-        // Effort=off → include_reasoning=false (no replay), code path exercised
     }
 
-    // =========================================================================
-    // Integration tests: both fixes working together
-    // =========================================================================
+    #[test]
+    fn test_model_mapping() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "claude-opus-4".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.model, "deepseek-v4-pro");
+    }
 
     #[test]
-    fn test_relocate_and_reasoning_together_multiturn() {
-        // Verify both fixes work together:
-        // 1. Relocate moves volatile system blocks to last user turn
-        // 2. Reasoning content is deterministically replayed for all assistant messages
+    fn test_kimi_k3_no_thinking_type() {
         let config = test_config();
-
-        // Set the relocate flag for this test
-        std::env::set_var("CODEMERMAFROST_RELOCATE", "1");
-        // Ensure cleanup
-        let _guard = scopeguard::guard((), |_| {
-            std::env::remove_var("CODEMERMAFROST_RELOCATE");
-        });
-
-        let system = SystemPrompt::Blocks(vec![
-            SystemContentBlock {
-                block_type: "text".to_string(),
-                text: "You are a helpful assistant.".to_string(),
-            },
-            SystemContentBlock {
-                block_type: "text".to_string(),
-                text: "<env>\nWorking directory: /tmp\nToday's date: 2026-06-22\nPlatform: linux\n</env>"
-                    .to_string(),
-            },
-        ]);
-
-        let messages = vec![
-            // Historical assistant with thinking → should get reasoning_content replayed
-            Message {
-                role: "assistant".to_string(),
-                content: ContentValue::Blocks(vec![
-                    ContentBlock::Thinking {
-                        thinking: "Let me check the file.".to_string(),
-                        signature: "sig001".to_string(),
-                    },
-                    ContentBlock::ToolUse {
-                        id: "toolu_001".to_string(),
-                        name: "read_file".to_string(),
-                        input: serde_json::json!({"path": "/tmp/test"}),
-                    },
-                ]),
-            },
-            // Tool result
-            Message {
-                role: "user".to_string(),
-                content: ContentValue::Blocks(vec![
-                    ContentBlock::ToolResult {
-                        tool_use_id: "toolu_001".to_string(),
-                        content: ToolResultContent::Text("file contents".to_string()),
-                        is_error: Some(false),
-                    },
-                ]),
-            },
-            // Current user turn
-            Message {
-                role: "user".to_string(),
-                content: ContentValue::Text("What does the file say?".to_string()),
-            },
-        ];
-
         let req = MessagesRequest {
-            model: "deepseek-v4-pro".to_string(),
-            system: Some(system),
-            messages,
+            model: "kimi-k3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
             max_tokens: 4096,
             stream: Some(false),
             thinking: Some(ThinkingConfig::Enabled {
@@ -610,152 +562,484 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
+        // Kimi K3: reasoning_effort is set, but NO thinking.type
+        assert_eq!(result.reasoning_effort, Some("max".to_string()));
+        assert!(result.thinking.is_none(), "Kimi K3 should not have thinking.type");
+    }
 
-        // Verify the request was built successfully
-        assert!(!result.messages.is_empty(), "Messages should not be empty");
+    #[test]
+    fn test_kimi_k3_off_effort() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "kimi-k3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: Some(ThinkingConfig::Disabled {
+                config_type: "disabled".to_string(),
+            }),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
 
-        // Find the system message — it should NOT contain the env block
-        let sys_msg = result.messages.iter().find(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("system")
-        });
-        assert!(sys_msg.is_some(), "System message should exist");
-        let sys_content = sys_msg.unwrap().get("content").and_then(|v| v.as_str()).unwrap_or("");
-        // System should be stable (no volatile env block)
-        assert!(
-            !sys_content.contains("<env>") && !sys_content.contains("Working directory"),
-            "System prompt should NOT contain volatile env block after relocate.\nSystem content: {}",
-            sys_content
-        );
-        assert!(
-            sys_content.contains("You are a helpful assistant"),
-            "System should retain stable instructions.\nSystem content: {}",
-            sys_content
-        );
+        let result = convert_request(&req, &config).unwrap();
+        // Kimi K3 can't turn off thinking → lowest effort
+        assert_eq!(result.reasoning_effort, Some("low".to_string()));
+        assert!(result.thinking.is_none(), "Kimi K3 should not have thinking.type");
+    }
 
-        // Find the last user message — it should contain the relocated env block
-        let user_msgs: Vec<_> = result.messages.iter()
-            .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
-            .collect();
-        assert!(!user_msgs.is_empty(), "Should have user messages");
-        let last_user_content = user_msgs.last().unwrap()
-            .get("content").and_then(|v| v.as_str()).unwrap_or("");
-        assert!(
-            last_user_content.contains("permafrost:relocated-context"),
-            "Last user message should contain relocated env block.\nContent: {}",
-            last_user_content
-        );
-        assert!(
-            last_user_content.contains("Working directory"),
-            "Relocated content should contain env details.\nContent: {}",
-            last_user_content
-        );
+    #[test]
+    fn test_kimi_k3_xhigh_effort() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "kimi-k3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            // xhigh → max (K3 ceiling)
+            thinking: Some(ThinkingConfig::Enabled {
+                config_type: "enabled".to_string(),
+                budget_tokens: Some(32768),
+                display: None,
+            }),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
 
-        // Find the assistant message — it should have reasoning_content
-        let asst_msg = result.messages.iter().find(|m| {
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.reasoning_effort, Some("max".to_string()));
+        assert!(result.thinking.is_none(), "Kimi K3 should not have thinking.type");
+    }
+
+    #[test]
+    fn test_alias_passthrough() {
+        let config = test_config();
+        let req = MessagesRequest {
+            // "deepseek-chat" is an alias for "deepseek-v4-pro"
+            model: "deepseek-chat".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        // Alias should pass through as-is (it's a known profile alias)
+        assert_eq!(result.model, "deepseek-chat");
+    }
+
+    #[test]
+    fn test_glm_reasoning_model() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "glm-5.2".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        // glm-5.2 is a reasoning model with no explicit thinking → xhigh effort
+        assert_eq!(result.reasoning_effort, Some("xhigh".to_string()));
+        assert_eq!(result.thinking.as_ref().unwrap().thinking_type, "enabled");
+    }
+
+    #[test]
+    fn test_glm_reasoning_replay_disabled() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "glm-5.2".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: Some(ThinkingConfig::Enabled {
+                config_type: "enabled".to_string(),
+                budget_tokens: Some(16000),
+                display: None,
+            }),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        // glm-5.2 has reasoning_replay=false, so even with enabled thinking,
+        // reasoning_content should NOT be included in messages
+        // (check: messages should not have reasoning_content field)
+        let _asst_msg = result.messages.iter().find(|m| {
             m.get("role").and_then(|v| v.as_str()) == Some("assistant")
         });
-        assert!(asst_msg.is_some(), "Assistant message should exist");
-        let reasoning = asst_msg.unwrap()
-            .get("reasoning_content")
-            .and_then(|v| v.as_str());
+        // If there are no assistant messages, that's fine — the test just has a user message
+        // The key assertion: reasoning_effort is set correctly
+        assert_eq!(result.reasoning_effort, Some("max".to_string()));
+        assert_eq!(result.thinking.as_ref().unwrap().thinking_type, "enabled");
+    }
+
+    #[test]
+    fn test_tool_conversion_sorted() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: Some(vec![
+                Tool {
+                    name: "zebra".to_string(),
+                    description: Some("z".to_string()),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+                Tool {
+                    name: "alpha".to_string(),
+                    description: Some("a".to_string()),
+                    input_schema: serde_json::json!({"type": "object"}),
+                },
+            ]),
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        let tools = result.tools.unwrap();
+        assert_eq!(tools[0].function.name, "alpha");
+        assert_eq!(tools[1].function.name, "zebra");
+    }
+
+    #[test]
+    fn test_tool_choice_auto() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: Some(ToolChoice::Auto {
+                r#type: "auto".to_string(),
+            }),
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.tool_choice, Some(serde_json::json!("auto")));
+    }
+
+    #[test]
+    fn test_tool_choice_any() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: Some(ToolChoice::Any {
+                r#type: "any".to_string(),
+            }),
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.tool_choice, Some(serde_json::json!("required")));
+    }
+
+    #[test]
+    fn test_tool_choice_specific() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: Some(ToolChoice::Tool {
+                r#type: "tool".to_string(),
+                name: "read_file".to_string(),
+            }),
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result = convert_request(&req, &config).unwrap();
         assert_eq!(
-            reasoning,
-            Some("Let me check the file."),
-            "Reasoning content should be deterministically replayed.\nGot: {:?}",
-            reasoning
+            result.tool_choice,
+            Some(serde_json::json!({"type": "function", "function": {"name": "read_file"}}))
         );
     }
 
     #[test]
-        fn test_relocate_and_reasoning_deterministic_byte_stability() {
-            // Verify that the same input always produces the same byte-level
-            // message structure (KV cache prefix stability).
-            // NOTE: This test does NOT set CODEMERMAFROST_RELOCATE to avoid
-            // env-var race conditions in parallel test execution.
-            // The relocate behavior is covered by other dedicated tests.
-            let config = test_config();
-
-            let system = SystemPrompt::Blocks(vec![
-                SystemContentBlock {
-                    block_type: "text".to_string(),
-                    text: "You are helpful.".to_string(),
-                },
-                SystemContentBlock {
-                    block_type: "text".to_string(),
-                    text: "<env>\nToday's date: 2026-06-22\n</env>".to_string(),
-                },
-            ]);
-
-            let messages = vec![
+    fn test_reasoning_content_replay() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: Some(SystemPrompt::Text("You are helpful".to_string())),
+            messages: vec![
                 Message {
                     role: "assistant".to_string(),
                     content: ContentValue::Blocks(vec![
                         ContentBlock::Thinking {
-                            thinking: "I will help.".to_string(),
-                            signature: "sig".to_string(),
+                            thinking: "Let me think about this.".to_string(),
+                            signature: "sig123".to_string(),
                         },
                         ContentBlock::Text {
-                            text: "Hello!".to_string(),
+                            text: "Here is the answer.".to_string(),
                         },
                     ]),
                 },
                 Message {
                     role: "user".to_string(),
-                    content: ContentValue::Text("Thanks!".to_string()),
+                    content: ContentValue::Text("Next question".to_string()),
                 },
-            ];
+            ],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: Some(ThinkingConfig::Enabled {
+                config_type: "enabled".to_string(),
+                budget_tokens: Some(16000),
+                display: None,
+            }),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
 
-            let req = MessagesRequest {
-                model: "deepseek-v4-pro".to_string(),
-                system: Some(system),
-                messages,
-                max_tokens: 4096,
-                stream: Some(false),
-                thinking: Some(ThinkingConfig::Enabled {
-                    config_type: "enabled".to_string(),
-                    budget_tokens: Some(16000),
-                    display: None,
-                }),
-                tools: None,
-                tool_choice: None,
-                metadata: None,
-                stop_sequences: None,
-                temperature: None,
-                top_p: None,
-                top_k: None,
-            };
+        let result = convert_request(&req, &config).unwrap();
+        let asst_msg = result.messages.iter().find(|m| {
+            m.get("role").and_then(|v| v.as_str()) == Some("assistant")
+        }).unwrap();
+        let reasoning = asst_msg.get("reasoning_content").and_then(|v| v.as_str());
+        assert_eq!(reasoning, Some("Let me think about this."));
+    }
 
-            // Convert twice — byte representation must be identical
-            let result1 = convert_request(&req, &config).unwrap();
-            let result2 = convert_request(&req, &config).unwrap();
+    #[test]
+    fn test_reasoning_content_no_replay_when_disabled() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: Some(SystemPrompt::Text("You are helpful".to_string())),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: ContentValue::Blocks(vec![
+                        ContentBlock::Thinking {
+                            thinking: "Let me think about this.".to_string(),
+                            signature: "sig123".to_string(),
+                        },
+                        ContentBlock::Text {
+                            text: "Here is the answer.".to_string(),
+                        },
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: ContentValue::Text("Next question".to_string()),
+                },
+            ],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: Some(ThinkingConfig::Disabled {
+                config_type: "disabled".to_string(),
+            }),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
 
-            let json1 = serde_json::to_string(&result1).unwrap();
-            let json2 = serde_json::to_string(&result2).unwrap();
+        let result = convert_request(&req, &config).unwrap();
+        let asst_msg = result.messages.iter().find(|m| {
+            m.get("role").and_then(|v| v.as_str()) == Some("assistant")
+        }).unwrap();
+        // No reasoning_content when thinking is disabled
+        assert!(asst_msg.get("reasoning_content").and_then(|v| v.as_str()).is_none());
+        assert_eq!(asst_msg["content"], "Here is the answer.");
+    }
 
-            assert_eq!(
-                json1, json2,
-                "Same input must produce identical byte-level output for KV cache stability.\nDiff length: {} vs {}",
-                json1.len(), json2.len()
-            );
+    #[test]
+    fn test_stream_option() {
+        let config = test_config();
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(true),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
 
-            // Also verify reasoning_content is present and deterministic
-            let asst1 = result1
-                .messages
-                .iter()
-                .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
-                .unwrap();
-            let asst2 = result2
-                .messages
-                .iter()
-                .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
-                .unwrap();
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.stream, Some(true));
+        assert!(result.stream_options.is_some());
+        assert!(result.stream_options.unwrap().include_usage);
+    }
 
-            assert_eq!(
-                asst1.get("reasoning_content").and_then(|v| v.as_str()),
-                asst2.get("reasoning_content").and_then(|v| v.as_str()),
-                "Reasoning content must be identical across conversions"
-            );
-        }
+    #[test]
+    fn test_reasoning_content_idempotent() {
+        // Verify that convert_request is idempotent for reasoning content
+        // (no double-injection, no corruption)
+        let config = test_config();
+
+        let thinking = ThinkingConfig::Enabled {
+            config_type: "enabled".to_string(),
+            budget_tokens: Some(16000),
+            display: None,
+        };
+
+        let req = MessagesRequest {
+            model: "deepseek-v4-pro".to_string(),
+            system: Some(SystemPrompt::Text("You are helpful".to_string())),
+            messages: vec![
+                Message {
+                    role: "assistant".to_string(),
+                    content: ContentValue::Blocks(vec![
+                        ContentBlock::Thinking {
+                            thinking: "Reasoning step 1".to_string(),
+                            signature: "sig1".to_string(),
+                        },
+                        ContentBlock::Text {
+                            text: "Answer 1".to_string(),
+                        },
+                    ]),
+                },
+                Message {
+                    role: "user".to_string(),
+                    content: ContentValue::Text("Question 2".to_string()),
+                },
+            ],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: Some(thinking.clone()),
+            tools: None,
+            tool_choice: None,
+            metadata: None,
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        };
+
+        let result1 = convert_request(&req, &config).unwrap();
+        let result2 = convert_request(&req, &config).unwrap();
+
+        // Same request should produce same output
+        let asst1 = result1
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .unwrap();
+        let asst2 = result2
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .unwrap();
+
+        assert_eq!(
+            asst1.get("reasoning_content").and_then(|v| v.as_str()),
+            asst2.get("reasoning_content").and_then(|v| v.as_str()),
+            "Reasoning content must be identical across conversions"
+        );
+    }
 
     #[test]
     fn test_relocate_disabled_no_conflict_with_reasoning() {

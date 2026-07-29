@@ -87,7 +87,7 @@ async fn handle_messages(
             }
         };
         let upstream_model = &openai_req.model;
-        let is_reasoning_model = requires_reasoning_content(upstream_model);
+        let is_reasoning_model = requires_reasoning_content(upstream_model, &config);
         let sse_response = process_stream(model, is_reasoning_model, msg_id, byte_stream);
         sse_response.into_response()
     } else {

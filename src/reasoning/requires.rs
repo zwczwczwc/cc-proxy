@@ -1,97 +1,131 @@
-/// Determines if a model requires reasoning_content in API messages.
-/// Translated from CodeWhale chat.rs L1897-L1913.
-pub fn requires_reasoning_content(model: &str) -> bool {
-    let model_lower = model.to_lowercase();
+use crate::config::Config;
 
-    // Kimi K3 series — always has reasoning enabled
-    if model_lower.starts_with("kimi-") {
-        return true;
-    }
-
-    // DeepSeek V4 series
-    if model_lower.starts_with("deepseek-v4") {
-        return true;
-    }
-
-    // GLM-5 series (glm-5.1, glm-5.2) — reasoning models
-    if model_lower.starts_with("glm-5") {
-        return true;
-    }
-
-    // DeepSeek chat/reasoner aliases
-    if model_lower == "deepseek-chat" || model_lower == "deepseek-reasoner" {
-        return true;
-    }
-
-    // Generic markers
-    if model_lower.contains("reasoner")
-        || model_lower.contains("-reasoning")
-        || model_lower.contains("-thinking")
-    {
-        return true;
-    }
-
-    // DeepSeek R-series markers (deepseek-r1, deepseek-r2, etc.)
-    if has_deepseek_r_series_marker(&model_lower) {
-        return true;
-    }
-
-    false
-}
-
-fn has_deepseek_r_series_marker(model: &str) -> bool {
-    let model_lower = model.to_lowercase();
-    if !model_lower.starts_with("deepseek") {
-        return false;
-    }
-    // Check for "deepseek-r" followed by a digit
-    if let Some(rest) = model_lower.strip_prefix("deepseek") {
-        let rest = rest.trim_start_matches('-');
-        if rest.starts_with('r') {
-            let after_r = &rest[1..];
-            if after_r.starts_with(|c: char| c.is_ascii_digit()) {
-                return true;
-            }
-        }
-    }
-    false
+/// Now config-driven: looks up the model in ModelProfile.reasoning_enabled.
+pub fn requires_reasoning_content(model: &str, config: &Config) -> bool {
+    config
+        .model_profile(model)
+        .map(|p| p.reasoning_enabled)
+        .unwrap_or(false)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Config;
+    use std::collections::HashMap;
 
-    #[test]
-    fn test_deepseek_v4_models() {
-        assert!(requires_reasoning_content("deepseek-v4-pro"));
-        assert!(requires_reasoning_content("deepseek-v4-flash"));
-        assert!(requires_reasoning_content("deepseek-v4"));
+    fn test_config() -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "deepseek".to_string(),
+            crate::config::ProviderConfig {
+                reasoning_field: "reasoning_content".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: Some("thinking".to_string()),
+                thinking_type_enabled: Some("enabled".to_string()),
+                thinking_type_disabled: Some("disabled".to_string()),
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "high".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+            },
+        );
+
+        let model_profiles = vec![
+            crate::config::ModelProfile {
+                name: "deepseek-v4-pro".to_string(),
+                provider: "deepseek".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: true,
+                aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+            },
+            crate::config::ModelProfile {
+                name: "deepseek-v4-flash".to_string(),
+                provider: "deepseek".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: true,
+                aliases: vec![],
+            },
+            crate::config::ModelProfile {
+                name: "glm-5.2".to_string(),
+                provider: "glm".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+            },
+            crate::config::ModelProfile {
+                name: "kimi-k3".to_string(),
+                provider: "fireworks".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+            },
+        ];
+
+        let mut profile_by_name = HashMap::new();
+        for (i, profile) in model_profiles.iter().enumerate() {
+            profile_by_name.insert(profile.name.clone(), i);
+            for alias in &profile.aliases {
+                profile_by_name.insert(alias.clone(), i);
+            }
+        }
+
+        let mut model_mapping = HashMap::new();
+        model_mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
+
+        Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            api_key: "test-key".to_string(),
+            log_level: "info".to_string(),
+            model_mapping,
+            default_model: "deepseek-v4-pro".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name,
+        }
     }
 
     #[test]
-    fn test_deepseek_r_series() {
-        assert!(requires_reasoning_content("deepseek-r1"));
-        assert!(requires_reasoning_content("deepseek-r2"));
+    fn test_deepseek_v4_models() {
+        let config = test_config();
+        assert!(requires_reasoning_content("deepseek-v4-pro", &config));
+        assert!(requires_reasoning_content("deepseek-v4-flash", &config));
+    }
+
+    #[test]
+    fn test_deepseek_aliases() {
+        let config = test_config();
+        assert!(requires_reasoning_content("deepseek-chat", &config));
+        assert!(requires_reasoning_content("deepseek-reasoner", &config));
     }
 
     #[test]
     fn test_non_reasoning_models() {
-        assert!(!requires_reasoning_content("gpt-4"));
-        assert!(!requires_reasoning_content("claude-sonnet-4"));
-        assert!(!requires_reasoning_content("llama-3"));
-    }
-
-    #[test]
-    fn test_reasoner_markers() {
-        assert!(requires_reasoning_content("some-reasoner-model"));
-        assert!(requires_reasoning_content("model-with-reasoning"));
-        assert!(requires_reasoning_content("model-with-thinking"));
+        let config = test_config();
+        assert!(!requires_reasoning_content("gpt-4", &config));
+        assert!(!requires_reasoning_content("claude-sonnet-4", &config));
+        assert!(!requires_reasoning_content("llama-3", &config));
     }
 
     #[test]
     fn test_kimi_models() {
-        assert!(requires_reasoning_content("kimi-k3"));
-        assert!(requires_reasoning_content("kimi-k3-pro"));
-        assert!(requires_reasoning_content("kimi-k3-flash"));
+        let config = test_config();
+        assert!(requires_reasoning_content("kimi-k3", &config));
+    }
+
+    #[test]
+    fn test_glm_model() {
+        let config = test_config();
+        assert!(requires_reasoning_content("glm-5.2", &config));
     }
 }

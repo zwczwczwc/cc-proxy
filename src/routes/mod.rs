@@ -6,7 +6,7 @@ use std::sync::Arc;
 pub fn create_router(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router {
     Router::new()
         .merge(messages::routes(client.clone(), config.clone()))
-        .merge(models::routes())
+        .merge(models::routes(config.clone()))
         .merge(health::routes())
 }
 
