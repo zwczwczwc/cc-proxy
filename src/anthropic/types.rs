@@ -236,6 +236,10 @@ pub enum ResponseContentBlock {
 pub struct Usage {
     pub input_tokens: u32,
     pub output_tokens: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
 }
 
 // --- SSE Event types ---
@@ -326,4 +330,8 @@ pub struct MessageDeltaData {
 pub struct StreamUsage {
     pub input_tokens: Option<u32>,
     pub output_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
 }

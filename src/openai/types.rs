@@ -184,6 +184,12 @@ pub struct FunctionCallDelta {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
+}
+
+#[derive(Debug, Clone, serde::Deserialize)]
 pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
@@ -194,14 +200,9 @@ pub struct Usage {
     /// DeepSeek: tokens NOT served from cache (billed at full price)
     #[serde(default)]
     pub prompt_cache_miss_tokens: Option<u32>,
-    /// GLM-5.2: cached tokens via prompt_tokens_details
+/// Standard OpenAI: cached tokens detail
+    #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
-}
-
-/// GLM-5.2: prompt_tokens_details from usage response
-#[derive(Debug, Clone, serde::Deserialize)]
-pub struct PromptTokensDetails {
-    pub cached_tokens: Option<u32>,
 }
 
 // --- Model list response ---

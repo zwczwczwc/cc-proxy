@@ -71,18 +71,50 @@ pub fn process_stream(
         let mut done = false;
         let mut completed = false; // dsv4-cc-proxy pattern: prevent duplicate finalize
         let mut last_usage: Option<crate::openai::types::Usage> = None;
+        let mut pending_finish_reason: Option<String> = None;
+        let mut pending_output_tokens: Option<u32> = None;
 
         loop {
             let chunk_result = match timeout(idle_timeout, stream.next()).await {
                 Ok(Some(Ok(chunk))) => Ok(chunk),
                 Ok(Some(Err(e))) => Err(e),
-                Ok(None) => break, // stream ended
+                Ok(None) => {
+                    // stream ended — finalize pending if any (eswitch may not send [DONE])
+                    if pending_finish_reason.is_some() {
+                        let output_tokens = last_usage.as_ref()
+                            .and_then(|u| u.completion_tokens)
+                            .or(pending_output_tokens);
+                        let final_events = state_machine.finalize(
+                            pending_finish_reason.as_deref(),
+                            output_tokens,
+                            last_usage.as_ref(),
+                        );
+                        for event in &final_events {
+                            let _ = tx.send(sse_event_to_axum(event)).await;
+                        }
+                        pending_finish_reason = None;
+                    }
+                    break;
+                }
                 Err(_elapsed) => {
                     tracing::warn!("SSE stream idle timeout after {:?}", idle_timeout);
-                    // Close all open blocks and send proper termination
-                    let final_events = state_machine.finalize(None, None);
-                    for event in &final_events {
-                        let _ = tx.send(sse_event_to_axum(event)).await;
+                    if pending_finish_reason.is_some() {
+                        let output_tokens = last_usage.as_ref()
+                            .and_then(|u| u.completion_tokens)
+                            .or(pending_output_tokens);
+                        let final_events = state_machine.finalize(
+                            pending_finish_reason.as_deref(),
+                            output_tokens,
+                            last_usage.as_ref(),
+                        );
+                        for event in &final_events {
+                            let _ = tx.send(sse_event_to_axum(event)).await;
+                        }
+                    } else {
+                        let final_events = state_machine.finalize(None, None, None);
+                        for event in &final_events {
+                            let _ = tx.send(sse_event_to_axum(event)).await;
+                        }
                     }
                     return;
                 }
@@ -119,6 +151,19 @@ pub fn process_stream(
                         };
 
                         if data == "[DONE]" {
+                            if completed && pending_finish_reason.is_some() {
+                                let output_tokens = last_usage.as_ref()
+                                    .and_then(|u| u.completion_tokens)
+                                    .or(pending_output_tokens);
+                                let final_events = state_machine.finalize(
+                                    pending_finish_reason.as_deref(),
+                                    output_tokens,
+                                    last_usage.as_ref(),
+                                );
+                                for event in &final_events {
+                                    let _ = tx.send(sse_event_to_axum(event)).await;
+                                }
+                            }
                             done = true;
                             break;
                         }
@@ -173,14 +218,8 @@ pub fn process_stream(
                                                 continue;
                                             }
                                             completed = true;
-                                            let final_events = state_machine.finalize(Some(fr), output_tokens);
-                                            for event in &final_events {
-                                                if tx.send(sse_event_to_axum(event)).await.is_err() {
-                                                    return;
-                                                }
-                                            }
-                                            done = true;
-                                            break;
+                                            pending_finish_reason = Some(fr.to_string());
+                                            pending_output_tokens = output_tokens;
                                         }
                                     } else if finish_reason.is_some() {
                                         // Delta was None but finish_reason is set
@@ -188,41 +227,56 @@ pub fn process_stream(
                                             continue;
                                         }
                                         completed = true;
-                                        let final_events = state_machine.finalize(finish_reason, output_tokens);
-                                        for event in &final_events {
-                                            if tx.send(sse_event_to_axum(event)).await.is_err() {
-                                                return;
-                                            }
-                                        }
-                                        done = true;
-                                        break;
+                                        pending_finish_reason = finish_reason.map(|s| s.to_string());
+                                        pending_output_tokens = output_tokens;
                                     }
                                 } else if let Some(fr) = finish_reason {
                                     if completed {
                                         continue;
                                     }
                                     completed = true;
-                                    let output_tokens = usage
+                                    pending_finish_reason = Some(fr.to_string());
+                                    pending_output_tokens = usage
                                         .as_ref()
                                         .and_then(|u| u.completion_tokens);
-                                    let final_events = state_machine.finalize(Some(fr), output_tokens);
-                                    for event in &final_events {
-                                        if tx.send(sse_event_to_axum(event)).await.is_err() {
-                                            return;
-                                        }
-                                    }
-                                    done = true;
-                                    break;
                                 }
                             }
                         }
 
-                        if done {
+                        if done || (completed && last_usage.is_some()) {
+                            if pending_finish_reason.is_some() {
+                                let output_tokens = last_usage.as_ref()
+                                    .and_then(|u| u.completion_tokens)
+                                    .or(pending_output_tokens);
+                                let final_events = state_machine.finalize(
+                                    pending_finish_reason.as_deref(),
+                                    output_tokens,
+                                    last_usage.as_ref(),
+                                );
+                                for event in &final_events {
+                                    let _ = tx.send(sse_event_to_axum(event)).await;
+                                }
+                                pending_finish_reason = None;
+                            }
                             break;
                         }
                     }
 
-                    if done {
+                    if done || (completed && last_usage.is_some()) {
+                        if pending_finish_reason.is_some() {
+                            let output_tokens = last_usage.as_ref()
+                                .and_then(|u| u.completion_tokens)
+                                .or(pending_output_tokens);
+                            let final_events = state_machine.finalize(
+                                pending_finish_reason.as_deref(),
+                                output_tokens,
+                                last_usage.as_ref(),
+                            );
+                            for event in &final_events {
+                                let _ = tx.send(sse_event_to_axum(event)).await;
+                            }
+                            pending_finish_reason = None;
+                        }
                         break;
                     }
                 }
@@ -256,7 +310,7 @@ pub fn process_stream(
         if done && !completed {
             tracing::warn!("[DONE] received without finish_reason — finalizing stream");
             completed = true;
-            let final_events = state_machine.finalize(None, None);
+            let final_events = state_machine.finalize(None, None, last_usage.as_ref());
             for event in &final_events {
                 let _ = tx.send(sse_event_to_axum(event)).await;
             }
@@ -266,7 +320,7 @@ pub fn process_stream(
         if !done && !completed {
             tracing::warn!("Stream ended without finish_reason or [DONE] — sending empty finalize");
             completed = true;
-            let final_events = state_machine.finalize(None, None);
+            let final_events = state_machine.finalize(None, None, last_usage.as_ref());
             for event in &final_events {
                 let _ = tx.send(sse_event_to_axum(event)).await;
             }
@@ -274,33 +328,23 @@ pub fn process_stream(
 
         // Log KV cache statistics if available
         if let Some(ref u) = last_usage {
-            // Try DeepSeek format first (hit+miss), then GLM format (cached_tokens)
-            let (hit, miss) = {
-                let ds_hit = u.prompt_cache_hit_tokens.unwrap_or(0);
-                let ds_miss = u.prompt_cache_miss_tokens.unwrap_or(0);
-                if ds_hit > 0 || ds_miss > 0 {
-                    (ds_hit, ds_miss)
-                } else if let Some(ref details) = u.prompt_tokens_details {
-                    if let Some(cached) = details.cached_tokens {
-                        let total_prompt = u.prompt_tokens.unwrap_or(0);
-                        (cached, total_prompt.saturating_sub(cached))
-                    } else {
-                        (0, 0)
-                    }
-                } else {
-                    (0, 0)
-                }
+let hit = u.prompt_tokens_details.as_ref()
+                .and_then(|d| d.cached_tokens)
+                .unwrap_or(0);
+            let prompt_total = u.prompt_tokens.unwrap_or(0);
+            let miss = prompt_total.saturating_sub(hit);
+            let rate = if prompt_total > 0 {
+                (hit as f64 / prompt_total as f64) * 100.0
+            } else {
+                0.0
             };
-            let total = hit + miss;
-            if total > 0 {
-                let rate = (hit as f64 / total as f64) * 100.0;
-                tracing::info!(
-                    cache_hit = hit,
-                    cache_miss = miss,
-                    hit_rate = format!("{:.1}%", rate),
-                    "KV cache stats"
-                );
-            }
+            tracing::info!(
+                cache_hit = hit,
+                cache_miss = miss,
+                prompt_tokens = prompt_total,
+                hit_rate = format!("{:.1}%", rate),
+                "KV cache stats"
+            );
         }
 
         // Explicitly drop the sender to close the SSE channel

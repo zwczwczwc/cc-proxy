@@ -65,10 +65,22 @@ pub fn convert_non_stream_response(
         Usage {
             input_tokens: 0,
             output_tokens: 0,
+            cache_read_input_tokens: None,
+            cache_creation_input_tokens: None,
         },
-        |u| Usage {
-            input_tokens: u.prompt_tokens.unwrap_or(0),
-            output_tokens: u.completion_tokens.unwrap_or(0),
+        |u| {
+            let cached = u.prompt_tokens_details.as_ref()
+                .and_then(|d| d.cached_tokens);
+            let cache_creation = match (u.prompt_tokens, cached) {
+                (Some(p), Some(c)) if p > c => Some(p - c),
+                _ => None,
+            };
+            Usage {
+                input_tokens: u.prompt_tokens.unwrap_or(0),
+                output_tokens: u.completion_tokens.unwrap_or(0),
+                cache_read_input_tokens: cached,
+                cache_creation_input_tokens: cache_creation,
+            }
         },
     );
 
@@ -116,6 +128,8 @@ pub struct SseStateMachine {
     message_start_sent: bool,
     /// Input tokens from usage
     input_tokens: Option<u32>,
+    /// Cached tokens from prompt_tokens_details (standard OpenAI format)
+    cached_tokens: Option<u32>,
 }
 
 impl SseStateMachine {
@@ -134,6 +148,7 @@ impl SseStateMachine {
             thinking_signature_sent: false,
             message_start_sent: false,
             input_tokens: None,
+            cached_tokens: None,
         }
     }
 
@@ -154,6 +169,8 @@ impl SseStateMachine {
         {
             if let Some(usage) = usage {
                 self.input_tokens = usage.prompt_tokens;
+                self.cached_tokens = usage.prompt_tokens_details.as_ref()
+                    .and_then(|d| d.cached_tokens);
             }
             return events;
         }
@@ -326,6 +343,7 @@ impl SseStateMachine {
         &mut self,
         stop_reason: Option<&str>,
         output_tokens: Option<u32>,
+        usage: Option<&crate::openai::types::Usage>,
     ) -> Vec<SseEvent> {
         let mut events = Vec::new();
 
@@ -358,16 +376,28 @@ impl SseStateMachine {
             events.push(SseEvent::ContentBlockStop { index: sse_idx });
         }
 
-        // Message delta
+        // Message delta — prefer usage from the chunk, fall back to self state
         let mapped_reason = stop_reason.map(|fr| map_finish_reason(fr));
+        let input_tokens = usage.and_then(|u| u.prompt_tokens).or(self.input_tokens);
+        let cached_tokens = usage
+            .and_then(|u| u.prompt_tokens_details.as_ref())
+            .and_then(|d| d.cached_tokens)
+            .or(self.cached_tokens);
+        let cache_read = cached_tokens;
+        let cache_creation = match (input_tokens, cached_tokens) {
+            (Some(p), Some(c)) if p > c => Some(p - c),
+            _ => None,
+        };
         events.push(SseEvent::MessageDelta {
             delta: MessageDeltaData {
                 stop_reason: mapped_reason,
                 stop_sequence: None,
             },
             usage: Some(StreamUsage {
-                input_tokens: self.input_tokens,
+                input_tokens,
                 output_tokens,
+                cache_read_input_tokens: cache_read,
+                cache_creation_input_tokens: cache_creation,
             }),
         });
 
@@ -390,6 +420,8 @@ impl SseStateMachine {
                 usage: Some(StreamUsage {
                     input_tokens: None,
                     output_tokens: None,
+                    cache_read_input_tokens: None,
+                    cache_creation_input_tokens: None,
                 }),
             },
         }
