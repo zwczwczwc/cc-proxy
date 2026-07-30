@@ -189,6 +189,7 @@ if let Some(prov) = provider {
                             .thinking_type_disabled
                             .clone()
                             .unwrap_or_else(|| "disabled".to_string()),
+                        clear_thinking: None,
                     });
                     req.reasoning_effort = None;
                 }
@@ -196,6 +197,7 @@ if let Some(prov) = provider {
                 // Fallback: unknown model, use default behavior
                 req.thinking = Some(DeepSeekThinking {
                     thinking_type: "disabled".to_string(),
+                    clear_thinking: None,
                 });
                 req.reasoning_effort = None;
             }
@@ -217,6 +219,7 @@ if let Some(prov) = provider {
                             .thinking_type_enabled
                             .clone()
                             .unwrap_or_else(|| "enabled".to_string()),
+                        clear_thinking: None,
                     });
                 }
             } else {
@@ -224,6 +227,7 @@ if let Some(prov) = provider {
                 req.reasoning_effort = Some("high".to_string());
                 req.thinking = Some(DeepSeekThinking {
                     thinking_type: "enabled".to_string(),
+                    clear_thinking: None,
                 });
             }
         }
