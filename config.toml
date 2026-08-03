@@ -1,18 +1,127 @@
-# cc-proxy model mapping configuration
-# This file is loaded at /etc/cc-proxy/config.toml inside the container.
-# Outside containers, set MODEL_CONFIG_PATH env var to point to this file.
+# cc-proxy v0.2.0 model configuration
+# 生产配置
 
 [models]
 default = "deepseek-v4-pro"
 
 [models.mapping]
-"claude-opus-4-7" = "deepseek-v4-pro"
-"claude-opus-4-6" = "deepseek-v4-pro"
-"claude-opus-4-5" = "deepseek-v4-pro"
-"claude-opus-4" = "deepseek-v4-pro"
-"claude-sonnet-4-6" = "deepseek-v4-pro"
+# L1: Opus → glm-5.2 (leader)
+"claude-opus-4-7" = "glm-5.2"
+"claude-opus-4-6" = "glm-5.2"
+"claude-opus-4-5" = "glm-5.2"
+"claude-opus-4" = "glm-5.2"
+# L2: Sonnet → gpt-5.6-luna (sonnet-4-6) / deepseek-v4-pro (others)
+"claude-sonnet-4-6" = "gpt-5.6-luna"
 "claude-sonnet-4-5" = "deepseek-v4-pro"
 "claude-sonnet-4" = "deepseek-v4-pro"
-"claude-haiku-4-5" = "deepseek-v4-pro"
-"claude-3-haiku" = "deepseek-v4-pro"
-"claude-haiku-4" = "deepseek-v4-pro"
+"claude-3-5-sonnet" = "deepseek-v4-pro"
+# L3: Haiku → deepseek-v4-flash (implement/debug)
+"claude-haiku-4-5" = "deepseek-v4-flash"
+"claude-haiku-4" = "deepseek-v4-flash"
+"claude-3-haiku" = "deepseek-v4-flash"
+# L4: Fable → kimi-k3 (moonshot)
+"fable-5" = "kimi-k3"
+
+# ── Provider 配置 ──
+
+[providers.deepseek]
+reasoning_field = "reasoning_content"
+thinking_param = "thinking"
+thinking_type_enabled = "enabled"
+thinking_type_disabled = "disabled"
+disable_thinking = false
+effort_param = "reasoning_effort"
+
+[providers.deepseek.effort_map]
+low = "high"
+medium = "high"
+high = "high"
+max = "max"
+xhigh = "max"
+
+[providers.glm]
+reasoning_field = "reasoning_content"
+thinking_param = "thinking"
+thinking_type_enabled = "enabled"
+thinking_type_disabled = "disabled"
+disable_thinking = false
+effort_param = "reasoning_effort"
+
+[providers.glm.effort_map]
+none = "none"
+minimal = "minimal"
+low = "low"
+medium = "medium"
+high = "high"
+xhigh = "xhigh"
+max = "max"
+
+[providers.moonshot]
+reasoning_field = "reasoning"
+disable_thinking = true
+effort_param = "reasoning_effort"
+
+[providers.moonshot.effort_map]
+low = "low"
+medium = "medium"
+high = "high"
+max = "max"
+xhigh = "max"
+
+[providers.gpt]
+reasoning_field = ""
+reasoning_field_alt = []
+# thinking_param 不设 → effort=other 时不发 thinking 字段
+thinking_type_enabled = "enabled"
+thinking_type_disabled = "disabled"
+disable_thinking = false
+effort_param = "reasoning_effort"
+
+[providers.gpt.effort_map]
+low = "low"
+medium = "medium"
+high = "high"
+max = "xhigh"
+xhigh = "xhigh"
+
+# ── 模型 Profile ─��
+
+[[model_profiles]]
+name = "deepseek-v4-pro"
+provider = "deepseek"
+reasoning_enabled = true
+reasoning_replay = true
+toolcall_requires_reasoning = true
+aliases = ["deepseek-chat", "deepseek-reasoner"]
+
+[[model_profiles]]
+name = "deepseek-v4-flash"
+provider = "deepseek"
+reasoning_enabled = true
+reasoning_replay = true
+toolcall_requires_reasoning = true
+aliases = []
+
+[[model_profiles]]
+name = "glm-5.2"
+provider = "glm"
+reasoning_enabled = true
+reasoning_replay = false
+toolcall_requires_reasoning = false
+aliases = []
+
+[[model_profiles]]
+name = "kimi-k3"
+provider = "moonshot"
+reasoning_enabled = true
+reasoning_replay = true
+toolcall_requires_reasoning = false
+aliases = []
+
+[[model_profiles]]
+name = "gpt-5.6-luna"
+provider = "gpt"
+reasoning_enabled = true
+reasoning_replay = false
+toolcall_requires_reasoning = false
+aliases = ["gpt-5.6-luna-2026-07-09"]
