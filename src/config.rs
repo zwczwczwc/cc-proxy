@@ -164,16 +164,15 @@ impl Config {
 
         // 3. reasoning_enabled=true with disable_thinking=false:
         //    thinking_param and thinking_type_enabled/disabled must be non-empty
+        //    Exception: thinking_param can be None for providers that don't support thinking (e.g. gpt)
         for profile in &self.model_profiles {
             if profile.reasoning_enabled {
                 if let Some(provider) = self.providers.get(&profile.provider) {
                     if !provider.disable_thinking {
                         if provider.thinking_param.is_none() {
-                            panic!(
-                                "Provider '{}' (used by '{}') has reasoning_enabled=true \
-                                 but thinking_param is not set",
-                                profile.provider, profile.name
-                            );
+                            // OK: provider intentionally doesn't support thinking (e.g. gpt-5.6)
+                            // Skip thinking_type checks since they're not applicable
+                            continue;
                         }
                         if provider.thinking_type_enabled.is_none() {
                             panic!(

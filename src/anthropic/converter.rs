@@ -114,6 +114,13 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     }
 
     // Apply reasoning effort from thinking config
+    // ★gpt provider + tools 互斥处理：gpt-5.6 拒绝 reasoning_effort+tools
+    let profile = config.model_profile(&openai_req.model);
+    let is_gpt_provider = profile
+        .map(|p| p.provider == "gpt")
+        .unwrap_or(false);
+    let has_tools = openai_req.tools.is_some();
+
     if let Some(thinking) = &req.thinking {
         if thinking.is_enabled() {
             let budget = thinking.budget_tokens().unwrap_or(0);
@@ -124,12 +131,14 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
             } else {
                 "high"
             };
+            let effort = if is_gpt_provider && has_tools { "off" } else { effort };
             apply_effort_direct(&mut openai_req, effort, config);
         } else {
             apply_effort_direct(&mut openai_req, "off", config);
         }
     } else if is_reasoning_model {
-        apply_effort_direct(&mut openai_req, "xhigh", config);
+        let effort = if is_gpt_provider && has_tools { "off" } else { "xhigh" };
+        apply_effort_direct(&mut openai_req, effort, config);
     }
 
     // GLM-5.2: 保留式思考需要 clear_thinking=false 在 thinking 对象内
@@ -182,6 +191,9 @@ if let Some(prov) = provider {
                         .unwrap_or_else(|| "low".to_string());
                     req.reasoning_effort = Some(lowest);
                     // Do NOT set thinking — provider doesn't support it
+                } else if prov.thinking_param.is_none() {
+                    // ★Provider doesn't support thinking (e.g. gpt); only remove reasoning_effort
+                    req.reasoning_effort = None;
                 } else {
                     // Set thinking.type = disabled
                     req.thinking = Some(DeepSeekThinking {
