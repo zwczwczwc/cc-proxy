@@ -3,6 +3,10 @@ use serde_json::Value;
 
 /// Anthropic Messages API request type
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "request fields are deserialized for protocol compatibility"
+)]
 pub struct MessagesRequest {
     pub model: String,
     pub system: Option<SystemPrompt>,
@@ -70,7 +74,11 @@ impl<'de> Deserialize<'de> for ContentValue {
             ContentValueInner::Raw(v) => {
                 // Log the unexpected value so we can see the actual root cause
                 let preview = format!("{}", v);
-                let preview = if preview.len() > 500 { &preview[..500] } else { &preview };
+                let preview = if preview.len() > 500 {
+                    &preview[..500]
+                } else {
+                    &preview
+                };
                 tracing::warn!(
                     raw_type = if v.is_null() { "null" } else if v.is_string() { "string" } else if v.is_array() { "array" } else if v.is_object() { "object" } else if v.is_number() { "number" } else if v.is_boolean() { "boolean" } else { "unknown" },
                     raw_preview = %preview,
@@ -83,15 +91,16 @@ impl<'de> Deserialize<'de> for ContentValue {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "response input variants preserve Anthropic protocol fields"
+)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
+    Thinking { thinking: String, signature: String },
     #[serde(rename = "redacted_thinking")]
     RedactedThinking { data: String },
     #[serde(rename = "tool_use")]
@@ -108,9 +117,7 @@ pub enum ContentBlock {
         is_error: Option<bool>,
     },
     #[serde(rename = "image")]
-    Image {
-        source: ImageSource,
-    },
+    Image { source: ImageSource },
     /// Catch-all for unknown content block types (e.g., server_tool_use, search_result)
     #[serde(other)]
     Unknown,
@@ -126,6 +133,10 @@ pub enum ToolResultContent {
 /// A single content block inside a tool_result.
 /// Anthropic API supports text and image blocks in tool results.
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "tool result image fields are deserialized for protocol compatibility"
+)]
 #[serde(tag = "type")]
 pub enum ToolResultContentBlock {
     #[serde(rename = "text")]
@@ -138,6 +149,10 @@ pub enum ToolResultContentBlock {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "image source fields are deserialized for protocol compatibility"
+)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
@@ -146,6 +161,10 @@ pub struct ImageSource {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "thinking configuration fields are deserialized for protocol compatibility"
+)]
 #[serde(untagged)]
 pub enum ThinkingConfig {
     Enabled {
@@ -167,7 +186,10 @@ pub enum ThinkingConfig {
 
 impl ThinkingConfig {
     pub fn is_enabled(&self) -> bool {
-        matches!(self, ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. })
+        matches!(
+            self,
+            ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }
+        )
     }
 
     pub fn budget_tokens(&self) -> Option<u32> {
@@ -187,6 +209,10 @@ pub struct Tool {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "tool choice type tags are deserialized for protocol compatibility"
+)]
 #[serde(untagged)]
 pub enum ToolChoice {
     Auto { r#type: String },
@@ -195,6 +221,10 @@ pub enum ToolChoice {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+#[expect(
+    dead_code,
+    reason = "metadata is deserialized for protocol compatibility"
+)]
 pub struct Metadata {
     pub user_id: Option<String>,
 }
@@ -218,10 +248,7 @@ pub struct MessagesResponse {
 #[serde(tag = "type")]
 pub enum ResponseContentBlock {
     #[serde(rename = "thinking")]
-    Thinking {
-        thinking: String,
-        signature: String,
-    },
+    Thinking { thinking: String, signature: String },
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
@@ -248,9 +275,7 @@ pub struct Usage {
 #[serde(tag = "type")]
 pub enum SseEvent {
     #[serde(rename = "message_start")]
-    MessageStart {
-        message: MessageStartData,
-    },
+    MessageStart { message: MessageStartData },
     #[serde(rename = "content_block_start")]
     ContentBlockStart {
         index: u32,
@@ -262,9 +287,7 @@ pub enum SseEvent {
         delta: ContentBlockDeltaData,
     },
     #[serde(rename = "content_block_stop")]
-    ContentBlockStop {
-        index: u32,
-    },
+    ContentBlockStop { index: u32 },
     #[serde(rename = "message_delta")]
     MessageDelta {
         delta: MessageDeltaData,
@@ -273,9 +296,7 @@ pub enum SseEvent {
     #[serde(rename = "message_stop")]
     MessageStop,
     #[serde(rename = "error")]
-    Error {
-        error: ErrorData,
-    },
+    Error { error: ErrorData },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -304,10 +325,18 @@ pub enum ContentBlockStartData {
     #[serde(rename = "text")]
     Text { text: String },
     #[serde(rename = "tool_use")]
-    ToolUse { id: String, name: String, input: Value },
+    ToolUse {
+        id: String,
+        name: String,
+        input: Value,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    clippy::enum_variant_names,
+    reason = "Anthropic SSE wire names require Delta suffixes"
+)]
 #[serde(tag = "type")]
 pub enum ContentBlockDeltaData {
     #[serde(rename = "thinking_delta")]

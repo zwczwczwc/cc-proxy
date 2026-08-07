@@ -33,6 +33,7 @@ mod tests {
                     m.insert("max".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -44,6 +45,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
                 aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "deepseek-v4-flash".to_string(),
@@ -52,6 +54,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "glm-5.2".to_string(),
@@ -60,6 +63,7 @@ mod tests {
                 reasoning_replay: false,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "kimi-k3".to_string(),
@@ -68,6 +72,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
         ];
 

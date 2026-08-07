@@ -30,8 +30,10 @@ fn re_date() -> &'static Regex {
 fn re_uuid() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b")
-            .unwrap()
+        Regex::new(
+            r"\b[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\b",
+        )
+        .unwrap()
     })
 }
 
@@ -111,7 +113,10 @@ pub fn stabilize_metadata(mut system: SystemPrompt) -> SystemPrompt {
     }
 
     if count > 0 {
-        tracing::info!(metadata_stabilized = count, "stabilize_metadata: pinned billing nonce");
+        tracing::info!(
+            metadata_stabilized = count,
+            "stabilize_metadata: pinned billing nonce"
+        );
     }
 
     system
@@ -185,9 +190,7 @@ pub fn migrate_volatile_system_blocks(
             existing.push_str(&appendix);
         }
         crate::anthropic::types::ContentValue::Blocks(ref mut existing_blocks) => {
-            existing_blocks.push(crate::anthropic::types::ContentBlock::Text {
-                text: appendix,
-            });
+            existing_blocks.push(crate::anthropic::types::ContentBlock::Text { text: appendix });
         }
         crate::anthropic::types::ContentValue::Null => {
             // Convert null content to text so we can append the relocated context
@@ -203,6 +206,28 @@ pub fn migrate_volatile_system_blocks(
 
     let new_system = SystemPrompt::Blocks(keep);
     (new_system, messages)
+}
+
+/// Extract volatile system blocks without mutating conversation history.
+pub fn split_volatile_system_blocks(system: SystemPrompt) -> (SystemPrompt, Vec<String>) {
+    let blocks = match &system {
+        SystemPrompt::Blocks(blocks) => blocks,
+        SystemPrompt::Text(_) => return (system, Vec::new()),
+    };
+    let mut keep = Vec::new();
+    let mut moved = Vec::new();
+    for block in blocks {
+        if count_volatile(&block.text) > 0 && looks_like_env_block(&block.text) {
+            moved.push(block.text.clone());
+        } else {
+            keep.push(block.clone());
+        }
+    }
+    if moved.is_empty() {
+        (system, moved)
+    } else {
+        (SystemPrompt::Blocks(keep), moved)
+    }
 }
 
 #[cfg(test)]
@@ -287,6 +312,26 @@ mod tests {
         match &new_messages[0].content {
             ContentValue::Text(t) => assert_eq!(t, "hello"),
             _ => panic!("expected Text"),
+        }
+    }
+
+    #[test]
+    fn relocate_on_does_not_mutate_previous_history_items() {
+        let system = SystemPrompt::Blocks(vec![SystemContentBlock {
+            block_type: "text".to_string(),
+            text: "<env>\nWorking directory: /tmp\nToday's date: 2026-06-22\n</env>".to_string(),
+        }]);
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: ContentValue::Text("historical user turn".to_string()),
+        }];
+
+        let (_, volatile) = split_volatile_system_blocks(system);
+        let relocated = messages;
+        assert_eq!(volatile.len(), 1);
+        match &relocated[0].content {
+            ContentValue::Text(text) => assert_eq!(text, "historical user turn"),
+            _ => panic!("expected historical text to remain unchanged"),
         }
     }
 }

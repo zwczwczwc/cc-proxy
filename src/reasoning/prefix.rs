@@ -6,8 +6,8 @@
 // for KV cache observability. No cross-request state — external
 // monitoring systems can aggregate and analyse fingerprints.
 
-use sha2::{Sha256, Digest};
 use crate::openai::types::OpenAiTool;
+use sha2::{Digest, Sha256};
 
 /// Computes a SHA-256 double-hash fingerprint of the system prompt and tools.
 ///
@@ -15,10 +15,7 @@ use crate::openai::types::OpenAiTool;
 /// SHA-256 is used for collision resistance; double-hash for extra stability.
 /// Tools are explicitly sorted by name to eliminate ordering differences
 /// (Reference: CodeWhale prefix_cache.rs:64-66).
-pub fn compute_prefix_fingerprint(
-    system_prompt: &str,
-    tools: Option<&[OpenAiTool]>,
-) -> String {
+pub fn compute_prefix_fingerprint(system_prompt: &str, tools: Option<&[OpenAiTool]>) -> String {
     let mut hasher = Sha256::new();
 
     // Hash the system prompt
@@ -27,10 +24,7 @@ pub fn compute_prefix_fingerprint(
     // Hash tools (sorted by name for deterministic output)
     if let Some(tools) = tools {
         // Collect tool names and sort them (reference: prefix_cache.rs:64-66)
-        let mut tool_names: Vec<&str> = tools
-            .iter()
-            .map(|t| t.function.name.as_str())
-            .collect();
+        let mut tool_names: Vec<&str> = tools.iter().map(|t| t.function.name.as_str()).collect();
         tool_names.sort();
 
         for name in &tool_names {
@@ -41,7 +35,7 @@ pub fn compute_prefix_fingerprint(
     // Double hash for extra stability
     let first = hasher.finalize();
     let mut second = Sha256::new();
-    second.update(&first);
+    second.update(first);
     let result = second.finalize();
 
     // Truncate to 16 hex chars for readability

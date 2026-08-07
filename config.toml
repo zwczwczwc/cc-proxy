@@ -5,11 +5,11 @@
 default = "deepseek-v4-pro"
 
 [models.mapping]
-# L1: Opus → glm-5.2 (leader)
-"claude-opus-4-7" = "glm-5.2"
-"claude-opus-4-6" = "glm-5.2"
-"claude-opus-4-5" = "glm-5.2"
-"claude-opus-4" = "glm-5.2"
+# L1: Opus → gpt-5.6-luna (Responses)
+"claude-opus-4-7" = "gpt-5.6-luna"
+"claude-opus-4-6" = "gpt-5.6-luna"
+"claude-opus-4-5" = "gpt-5.6-luna"
+"claude-opus-4" = "gpt-5.6-luna"
 # L2: Sonnet → gpt-5.6-luna (sonnet-4-6) / deepseek-v4-pro (others)
 "claude-sonnet-4-6" = "gpt-5.6-luna"
 "claude-sonnet-4-5" = "deepseek-v4-pro"
@@ -81,7 +81,7 @@ effort_param = "reasoning_effort"
 low = "low"
 medium = "medium"
 high = "high"
-max = "xhigh"
+max = "max"
 xhigh = "xhigh"
 
 # ── 模型 Profile ─��
@@ -121,6 +121,7 @@ aliases = []
 [[model_profiles]]
 name = "gpt-5.6-luna"
 provider = "gpt"
+wire_api = "responses"
 reasoning_enabled = true
 reasoning_replay = false
 toolcall_requires_reasoning = false

@@ -1,5 +1,5 @@
-use serde_json::{json, Value};
 use crate::anthropic::types::{ContentBlock, ContentValue, Message, SystemPrompt};
+use serde_json::{json, Value};
 
 /// Compute a hash key for tool_result deduplication (P1-3).
 fn compute_result_key(content: &str) -> String {
@@ -18,7 +18,11 @@ fn compact_tool_result(content: &str) -> String {
         content.to_string()
     } else {
         // Safe UTF-8 char boundary slicing (P5-2: fix panic on multi-byte chars)
-        let head_end = content.char_indices().nth(HEAD).map(|(i, _)| i).unwrap_or(content.len());
+        let head_end = content
+            .char_indices()
+            .nth(HEAD)
+            .map(|(i, _)| i)
+            .unwrap_or(content.len());
         let tail_start = content
             .char_indices()
             .rev()
@@ -66,7 +70,9 @@ pub fn build_chat_messages_with_reasoning(
             "user" => {
                 // Check if this is actually a tool_result message
                 if let ContentValue::Blocks(blocks) = &msg.content {
-                    let has_tool_results = blocks.iter().any(|b| matches!(b, ContentBlock::ToolResult { .. }));
+                    let has_tool_results = blocks
+                        .iter()
+                        .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
                     if has_tool_results {
                         // Convert to tool role messages with dedup + compression (P1-3)
                         for block in blocks {
@@ -134,19 +140,17 @@ pub fn build_chat_messages_with_reasoning(
 fn system_prompt_to_text(sys: &SystemPrompt) -> String {
     match sys {
         SystemPrompt::Text(s) => s.clone(),
-        SystemPrompt::Blocks(blocks) => {
-            blocks
-                .iter()
-                .filter_map(|b| {
-                    if b.block_type == "text" {
-                        Some(b.text.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        SystemPrompt::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| {
+                if b.block_type == "text" {
+                    Some(b.text.clone())
+                } else {
+                    None
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -176,7 +180,9 @@ fn convert_user_message(content: &ContentValue) -> Value {
         ContentValue::Null => Value::Null,
         ContentValue::Blocks(blocks) => {
             // Check if it's a simple text block array
-            let all_text = blocks.iter().all(|b| matches!(b, ContentBlock::Text { .. }));
+            let all_text = blocks
+                .iter()
+                .all(|b| matches!(b, ContentBlock::Text { .. }));
             if all_text {
                 let text: String = blocks
                     .iter()
@@ -196,15 +202,10 @@ fn convert_user_message(content: &ContentValue) -> Value {
             let parts: Vec<Value> = blocks
                 .iter()
                 .filter_map(|block| match block {
-                    ContentBlock::Text { text } => {
-                        Some(json!({"type": "text", "text": text}))
-                    }
+                    ContentBlock::Text { text } => Some(json!({"type": "text", "text": text})),
                     ContentBlock::Image { source } => {
                         // Convert Anthropic base64 image to OpenAI data URL
-                        let data_url = format!(
-                            "data:{};base64,{}",
-                            source.media_type, source.data
-                        );
+                        let data_url = format!("data:{};base64,{}", source.media_type, source.data);
                         Some(json!({
                             "type": "image_url",
                             "image_url": {"url": data_url}
@@ -239,19 +240,19 @@ fn convert_user_message(content: &ContentValue) -> Value {
 fn tool_result_to_text(content: &crate::anthropic::types::ToolResultContent) -> String {
     match content {
         crate::anthropic::types::ToolResultContent::Text(s) => s.clone(),
-        crate::anthropic::types::ToolResultContent::Blocks(blocks) => {
-            blocks
-                .iter()
-                .filter_map(|b| match b {
-                    crate::anthropic::types::ToolResultContentBlock::Text { text } => Some(text.clone()),
-                    crate::anthropic::types::ToolResultContentBlock::Image { source: _ } => {
-                        Some("[image]".to_string())
-                    }
-                    crate::anthropic::types::ToolResultContentBlock::Unknown => None,
-                })
-                .collect::<Vec<_>>()
-                .join("\n")
-        }
+        crate::anthropic::types::ToolResultContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|b| match b {
+                crate::anthropic::types::ToolResultContentBlock::Text { text } => {
+                    Some(text.clone())
+                }
+                crate::anthropic::types::ToolResultContentBlock::Image { source: _ } => {
+                    Some("[image]".to_string())
+                }
+                crate::anthropic::types::ToolResultContentBlock::Unknown => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
     }
 }
 
@@ -278,7 +279,10 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
 
     for block in blocks {
         match block {
-            ContentBlock::Thinking { thinking, signature: _ } => {
+            ContentBlock::Thinking {
+                thinking,
+                signature: _,
+            } => {
                 thinking_parts.push(thinking.clone());
             }
             ContentBlock::RedactedThinking { data: _ } => {
@@ -317,7 +321,9 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
     // simply omit the field when there's nothing to replay.
     let mut has_reasoning = include_reasoning && !reasoning_content_str.trim().is_empty();
     if include_reasoning && has_tool_calls && !has_reasoning {
-        tracing::warn!("Substituting placeholder reasoning_content for tool-call assistant message");
+        tracing::warn!(
+            "Substituting placeholder reasoning_content for tool-call assistant message"
+        );
         reasoning_content_str = "(reasoning omitted)".to_string();
         has_reasoning = true;
     }
@@ -358,11 +364,7 @@ fn cleanup_orphan_tool_calls(messages: &mut Vec<Value>) {
         .iter()
         .enumerate()
         .rev()
-        .find(|(_, msg)| {
-            msg.get("role")
-                .and_then(|v| v.as_str())
-                .map_or(false, |r| r == "assistant")
-        })
+        .find(|(_, msg)| msg.get("role").and_then(|v| v.as_str()) == Some("assistant"))
         .map(|(i, _)| i);
 
     for (i, msg) in messages.iter().enumerate() {
@@ -371,10 +373,7 @@ fn cleanup_orphan_tool_calls(messages: &mut Vec<Value>) {
             continue;
         }
 
-        let is_assistant = msg
-            .get("role")
-            .and_then(|v| v.as_str())
-            .map_or(false, |r| r == "assistant");
+        let is_assistant = msg.get("role").and_then(|v| v.as_str()) == Some("assistant");
 
         if !is_assistant {
             continue;
@@ -397,11 +396,8 @@ fn cleanup_orphan_tool_calls(messages: &mut Vec<Value>) {
 
         // Scan subsequent messages for matching tool results
         let mut found_ids: HashSet<String> = HashSet::new();
-        for j in (i + 1)..messages.len() {
-            if let Some(tool_id) = messages[j]
-                .get("tool_call_id")
-                .and_then(|v| v.as_str())
-            {
+        for message in messages.iter().skip(i + 1) {
+            if let Some(tool_id) = message.get("tool_call_id").and_then(|v| v.as_str()) {
                 found_ids.insert(tool_id.to_string());
             }
         }
@@ -422,9 +418,7 @@ fn cleanup_orphan_tool_calls(messages: &mut Vec<Value>) {
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|tc| {
-                            tc.get("id")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string())
+                            tc.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
                         })
                         .collect()
                 })
@@ -436,7 +430,7 @@ fn cleanup_orphan_tool_calls(messages: &mut Vec<Value>) {
             // If assistant had no content, remove the entire message
             let has_content = obj
                 .get("content")
-                .map_or(false, |v| !v.is_null() && v.as_str() != Some(""));
+                .is_some_and(|v| !v.is_null() && v.as_str() != Some(""));
 
             if !has_content {
                 messages.remove(idx);
@@ -446,7 +440,7 @@ fn cleanup_orphan_tool_calls(messages: &mut Vec<Value>) {
             messages.retain(|msg| {
                 msg.get("tool_call_id")
                     .and_then(|v| v.as_str())
-                    .map_or(true, |tid| !orphan_ids.contains(&tid.to_string()))
+                    .is_none_or(|tid| !orphan_ids.contains(&tid.to_string()))
             });
         }
     }
@@ -564,8 +558,10 @@ mod tests {
         }];
         let result = build_chat_messages_with_reasoning(None, &messages, false);
         assert_eq!(result.len(), 1);
-        assert!(result[0].get("reasoning_content").is_none()
-            || result[0]["reasoning_content"].is_null());
+        assert!(
+            result[0].get("reasoning_content").is_none()
+                || result[0]["reasoning_content"].is_null()
+        );
         assert_eq!(result[0]["content"], "here is the answer");
     }
 

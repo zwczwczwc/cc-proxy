@@ -15,9 +15,15 @@ pub fn sse_event_to_axum(event: &SseEvent) -> Event {
     let json = serde_json::to_string(event).unwrap_or_default();
     match event {
         SseEvent::MessageStart { .. } => Event::default().event("message_start").data(json),
-        SseEvent::ContentBlockStart { .. } => Event::default().event("content_block_start").data(json),
-        SseEvent::ContentBlockDelta { .. } => Event::default().event("content_block_delta").data(json),
-        SseEvent::ContentBlockStop { .. } => Event::default().event("content_block_stop").data(json),
+        SseEvent::ContentBlockStart { .. } => {
+            Event::default().event("content_block_start").data(json)
+        }
+        SseEvent::ContentBlockDelta { .. } => {
+            Event::default().event("content_block_delta").data(json)
+        }
+        SseEvent::ContentBlockStop { .. } => {
+            Event::default().event("content_block_stop").data(json)
+        }
         SseEvent::MessageDelta { .. } => Event::default().event("message_delta").data(json),
         SseEvent::MessageStop => Event::default().event("message_stop").data(json),
         SseEvent::Error { .. } => Event::default().event("error").data(json),
@@ -45,7 +51,7 @@ pub fn process_stream(
     reasoning_field: String,
     reasoning_field_alt: Vec<String>,
     msg_id: String,
-    mut body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
+    body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(256);
 
@@ -58,7 +64,8 @@ pub fn process_stream(
     );
 
     tokio::spawn(async move {
-        let mut state_machine = SseStateMachine::new(is_reasoning_model, reasoning_field, reasoning_field_alt);
+        let mut state_machine =
+            SseStateMachine::new(is_reasoning_model, reasoning_field, reasoning_field_alt);
 
         // Send message_start first (audit defect 3.1)
         let msg_start = state_machine.message_start(&model, &msg_id);
@@ -81,7 +88,8 @@ pub fn process_stream(
                 Ok(None) => {
                     // stream ended — finalize pending if any (eswitch may not send [DONE])
                     if pending_finish_reason.is_some() {
-                        let output_tokens = last_usage.as_ref()
+                        let output_tokens = last_usage
+                            .as_ref()
                             .and_then(|u| u.completion_tokens)
                             .or(pending_output_tokens);
                         let final_events = state_machine.finalize(
@@ -92,14 +100,14 @@ pub fn process_stream(
                         for event in &final_events {
                             let _ = tx.send(sse_event_to_axum(event)).await;
                         }
-                        pending_finish_reason = None;
                     }
                     break;
                 }
                 Err(_elapsed) => {
                     tracing::warn!("SSE stream idle timeout after {:?}", idle_timeout);
                     if pending_finish_reason.is_some() {
-                        let output_tokens = last_usage.as_ref()
+                        let output_tokens = last_usage
+                            .as_ref()
                             .and_then(|u| u.completion_tokens)
                             .or(pending_output_tokens);
                         let final_events = state_machine.finalize(
@@ -127,7 +135,10 @@ pub fn process_stream(
 
                     // P0-2: buffer size guard
                     if buffer.len() > MAX_SSE_BUF {
-                        tracing::error!("SSE buffer exceeded {} bytes, aborting stream", MAX_SSE_BUF);
+                        tracing::error!(
+                            "SSE buffer exceeded {} bytes, aborting stream",
+                            MAX_SSE_BUF
+                        );
                         break;
                     }
 
@@ -152,7 +163,8 @@ pub fn process_stream(
 
                         if data == "[DONE]" {
                             if completed && pending_finish_reason.is_some() {
-                                let output_tokens = last_usage.as_ref()
+                                let output_tokens = last_usage
+                                    .as_ref()
                                     .and_then(|u| u.completion_tokens)
                                     .or(pending_output_tokens);
                                 let final_events = state_machine.finalize(
@@ -178,16 +190,16 @@ pub fn process_stream(
                         };
 
                         // Extract usage
-                        let usage: Option<crate::openai::types::Usage> =
-                            chunk_value.get("usage").and_then(|u| {
-                                serde_json::from_value(u.clone()).ok()
-                            });
+                        let usage: Option<crate::openai::types::Usage> = chunk_value
+                            .get("usage")
+                            .and_then(|u| serde_json::from_value(u.clone()).ok());
                         if let Some(ref u) = usage {
                             last_usage = Some(u.clone());
                         }
 
                         // Extract choices
-                        if let Some(choices) = chunk_value.get("choices").and_then(|v| v.as_array()) {
+                        if let Some(choices) = chunk_value.get("choices").and_then(|v| v.as_array())
+                        {
                             for choice in choices {
                                 let finish_reason = choice
                                     .get("finish_reason")
@@ -200,12 +212,12 @@ pub fn process_stream(
                                     let chat_delta: Option<crate::openai::types::ChatDelta> =
                                         serde_json::from_value(delta.clone()).ok();
 
-                                    let output_tokens = usage
-                                        .as_ref()
-                                        .and_then(|u| u.completion_tokens);
+                                    let output_tokens =
+                                        usage.as_ref().and_then(|u| u.completion_tokens);
 
                                     if let Some(ref cd) = chat_delta {
-                                        let events = state_machine.process_delta(cd, usage.as_ref());
+                                        let events =
+                                            state_machine.process_delta(cd, usage.as_ref());
                                         for event in &events {
                                             if tx.send(sse_event_to_axum(event)).await.is_err() {
                                                 return; // Client disconnected
@@ -227,7 +239,8 @@ pub fn process_stream(
                                             continue;
                                         }
                                         completed = true;
-                                        pending_finish_reason = finish_reason.map(|s| s.to_string());
+                                        pending_finish_reason =
+                                            finish_reason.map(|s| s.to_string());
                                         pending_output_tokens = output_tokens;
                                     }
                                 } else if let Some(fr) = finish_reason {
@@ -236,16 +249,16 @@ pub fn process_stream(
                                     }
                                     completed = true;
                                     pending_finish_reason = Some(fr.to_string());
-                                    pending_output_tokens = usage
-                                        .as_ref()
-                                        .and_then(|u| u.completion_tokens);
+                                    pending_output_tokens =
+                                        usage.as_ref().and_then(|u| u.completion_tokens);
                                 }
                             }
                         }
 
                         if done || (completed && last_usage.is_some()) {
                             if pending_finish_reason.is_some() {
-                                let output_tokens = last_usage.as_ref()
+                                let output_tokens = last_usage
+                                    .as_ref()
                                     .and_then(|u| u.completion_tokens)
                                     .or(pending_output_tokens);
                                 let final_events = state_machine.finalize(
@@ -264,7 +277,8 @@ pub fn process_stream(
 
                     if done || (completed && last_usage.is_some()) {
                         if pending_finish_reason.is_some() {
-                            let output_tokens = last_usage.as_ref()
+                            let output_tokens = last_usage
+                                .as_ref()
                                 .and_then(|u| u.completion_tokens)
                                 .or(pending_output_tokens);
                             let final_events = state_machine.finalize(
@@ -275,7 +289,6 @@ pub fn process_stream(
                             for event in &final_events {
                                 let _ = tx.send(sse_event_to_axum(event)).await;
                             }
-                            pending_finish_reason = None;
                         }
                         break;
                     }
@@ -295,13 +308,13 @@ pub fn process_stream(
 
         // Drain remaining chunks after [DONE] to prevent stale events in cc-connect
         // (10s timeout protection against upstream hanging)
-        if let Err(_) = timeout(
-            tokio::time::Duration::from_secs(10),
-            async {
-                use futures_util::StreamExt;
-                while let Some(_) = stream.next().await {}
-            },
-        ).await {
+        if timeout(tokio::time::Duration::from_secs(10), async {
+            use futures_util::StreamExt;
+            while stream.next().await.is_some() {}
+        })
+        .await
+        .is_err()
+        {
             tracing::warn!("Drain timeout after 10s, dropping stream");
         }
 
@@ -309,7 +322,6 @@ pub fn process_stream(
         // When [DONE] is received, done=true but finalize() was never called.
         if done && !completed {
             tracing::warn!("[DONE] received without finish_reason — finalizing stream");
-            completed = true;
             let final_events = state_machine.finalize(None, None, last_usage.as_ref());
             for event in &final_events {
                 let _ = tx.send(sse_event_to_axum(event)).await;
@@ -319,7 +331,6 @@ pub fn process_stream(
         // If stream ended naturally without finish_reason or [DONE], finalize
         if !done && !completed {
             tracing::warn!("Stream ended without finish_reason or [DONE] — sending empty finalize");
-            completed = true;
             let final_events = state_machine.finalize(None, None, last_usage.as_ref());
             for event in &final_events {
                 let _ = tx.send(sse_event_to_axum(event)).await;
@@ -328,7 +339,9 @@ pub fn process_stream(
 
         // Log KV cache statistics if available
         if let Some(ref u) = last_usage {
-let hit = u.prompt_tokens_details.as_ref()
+            let hit = u
+                .prompt_tokens_details
+                .as_ref()
                 .and_then(|d| d.cached_tokens)
                 .unwrap_or(0);
             let prompt_total = u.prompt_tokens.unwrap_or(0);
