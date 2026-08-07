@@ -1,6 +1,6 @@
-use axum::{Json, Router, extract::State, routing::get};
-use std::sync::Arc;
 use crate::config::Config;
+use axum::{extract::State, routing::get, Json, Router};
+use std::sync::Arc;
 
 pub fn routes(config: Arc<Config>) -> Router {
     Router::new()

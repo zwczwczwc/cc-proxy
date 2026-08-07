@@ -1,6 +1,6 @@
-use axum::Router;
 use crate::client::DeepSeekClient;
 use crate::config::Config;
+use axum::Router;
 use std::sync::Arc;
 
 pub fn create_router(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router {
@@ -10,6 +10,6 @@ pub fn create_router(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router
         .merge(health::routes())
 }
 
+pub mod health;
 pub mod messages;
 pub mod models;
-pub mod health;

@@ -1,26 +1,23 @@
-mod config;
-mod client;
 mod anthropic;
+mod client;
+mod config;
 mod openai;
 mod reasoning;
-mod sse;
+mod responses;
 mod routes;
+mod sse;
 
+use axum::extract::DefaultBodyLimit;
 use std::sync::Arc;
 use tokio::signal;
-use tower_http::cors::{CorsLayer, Any};
-use axum::extract::DefaultBodyLimit;
+use tower_http::cors::{Any, CorsLayer};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Initialize logging
-    let env_filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info"));
-    fmt()
-        .with_env_filter(env_filter)
-        .with_target(false)
-        .init();
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    fmt().with_env_filter(env_filter).with_target(false).init();
 
     let config = Arc::new(config::Config::from_env());
 

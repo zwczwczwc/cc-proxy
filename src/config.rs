@@ -1,8 +1,8 @@
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::PathBuf;
-use serde::Deserialize;
 
 /// TOML config file structure.
 #[derive(Debug, Clone, Deserialize)]
@@ -38,9 +38,14 @@ pub struct ProviderConfig {
     #[serde(default)]
     pub disable_thinking: bool,
     /// API parameter name for reasoning effort (e.g. "reasoning_effort").
+    #[allow(dead_code)]
     pub effort_param: String,
     /// Maps Anthropic effort levels to provider-specific values.
     pub effort_map: HashMap<String, String>,
+    /// Responses-only visible reasoning summary mode (off/auto/detailed).
+    /// This is response control and is excluded from cache identity hashes.
+    #[serde(default)]
+    pub responses_reasoning_summary: Option<String>,
 }
 
 /// Per-model behavioral profile.
@@ -58,13 +63,33 @@ pub struct ModelProfile {
     pub reasoning_replay: bool,
     /// Whether tool-call requests require reasoning_content to be present.
     #[serde(default)]
+    #[expect(
+        dead_code,
+        reason = "model behavior setting is retained for compatibility"
+    )]
     pub toolcall_requires_reasoning: bool,
     /// Alternative names for this model (e.g. "deepseek-chat" → "deepseek-v4-pro").
     #[serde(default)]
     pub aliases: Vec<String>,
+    /// Upstream wire protocol. Legacy profiles default to Chat Completions.
+    #[serde(default)]
+    pub wire_api: WireApi,
+}
+
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WireApi {
+    #[serde(rename = "chat_completions")]
+    #[default]
+    ChatCompletions,
+    Responses,
 }
 
 #[derive(Debug, Clone)]
+#[expect(
+    dead_code,
+    reason = "configuration fields are retained for runtime integrations"
+)]
 pub struct Config {
     pub listen_addr: String,
     pub eswitch_url: String,
@@ -83,14 +108,11 @@ impl Config {
         let (model_mapping, default_model, model_profiles, providers) = Self::load_model_config();
 
         let mut config = Self {
-            listen_addr: env::var("LISTEN_ADDR")
-                .unwrap_or_else(|_| "0.0.0.0:11435".to_string()),
+            listen_addr: env::var("LISTEN_ADDR").unwrap_or_else(|_| "0.0.0.0:11435".to_string()),
             eswitch_url: env::var("ESWITCH_URL")
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
-            api_key: env::var("DEEPSEEK_API_KEY")
-                .unwrap_or_else(|_| "not-needed".to_string()),
-            log_level: env::var("RUST_LOG")
-                .unwrap_or_else(|_| "info".to_string()),
+            api_key: env::var("DEEPSEEK_API_KEY").unwrap_or_else(|_| "not-needed".to_string()),
+            log_level: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
             model_mapping,
             default_model,
             model_profiles,
@@ -122,14 +144,19 @@ impl Config {
         self.providers.get(provider)
     }
 
+    /// Return the configured wire API for a canonical model name or alias.
+    pub fn wire_api_for_model(&self, model: &str) -> WireApi {
+        self.model_profile(model)
+            .map(|profile| profile.wire_api.clone())
+            .unwrap_or_default()
+    }
+
     /// Build the profile_by_name index from model_profiles (names + aliases).
     fn build_profile_index(&mut self) {
         for (i, profile) in self.model_profiles.iter().enumerate() {
-            self.profile_by_name
-                .insert(profile.name.clone(), i);
+            self.profile_by_name.insert(profile.name.clone(), i);
             for alias in &profile.aliases {
-                self.profile_by_name
-                    .insert(alias.clone(), i);
+                self.profile_by_name.insert(alias.clone(), i);
             }
         }
     }
@@ -150,7 +177,7 @@ impl Config {
         }
 
         // 2. Default model must be in model_profiles
-        if self.profile_by_name.get(&self.default_model).is_none() {
+        if !self.profile_by_name.contains_key(&self.default_model) {
             panic!(
                 "Default model '{}' not found in model_profiles. \
                  Available: {:?}",
@@ -273,43 +300,37 @@ impl Config {
 
         if let Some(path) = config_path {
             match fs::read_to_string(&path) {
-                Ok(contents) => {
-                    match toml::from_str::<ConfigFile>(&contents) {
-                        Ok(cf) => {
-                            let mapping = cf
-                                .models
-                                .as_ref()
-                                .and_then(|m| m.mapping.clone())
-                                .unwrap_or_default();
-                            let default = cf
-                                .models
-                                .as_ref()
-                                .and_then(|m| m.default.clone())
-                                .unwrap_or_else(|| "deepseek-v4-pro".to_string());
-                            let providers =
-                                cf.providers.unwrap_or_else(Self::builtin_default_providers);
-                            let model_profiles = cf
-                                .model_profiles
-                                .unwrap_or_else(Self::builtin_default_profiles);
-                            tracing::info!("Loaded model config from {}", path.display());
-                            return (mapping, default, model_profiles, providers);
-                        }
-                        Err(e) => {
-                            panic!(
+                Ok(contents) => match toml::from_str::<ConfigFile>(&contents) {
+                    Ok(cf) => {
+                        let mapping = cf
+                            .models
+                            .as_ref()
+                            .and_then(|m| m.mapping.clone())
+                            .unwrap_or_default();
+                        let default = cf
+                            .models
+                            .as_ref()
+                            .and_then(|m| m.default.clone())
+                            .unwrap_or_else(|| "deepseek-v4-pro".to_string());
+                        let providers =
+                            cf.providers.unwrap_or_else(Self::builtin_default_providers);
+                        let model_profiles = cf
+                            .model_profiles
+                            .unwrap_or_else(Self::builtin_default_profiles);
+                        tracing::info!("Loaded model config from {}", path.display());
+                        return (mapping, default, model_profiles, providers);
+                    }
+                    Err(e) => {
+                        panic!(
                                 "Failed to parse model config from {}: {}. \
                                  Config file must be valid TOML. Fix the syntax error or remove the file.",
                                 path.display(),
                                 e
                             );
-                        }
                     }
-                }
+                },
                 Err(e) => {
-                    panic!(
-                        "Failed to read config file {}: {}",
-                        path.display(),
-                        e
-                    );
+                    panic!("Failed to read config file {}: {}", path.display(), e);
                 }
             }
         }
@@ -334,14 +355,35 @@ impl Config {
         mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
         // Claude Sonnet variants → v4-flash (cost-effective for most tasks)
         mapping.insert("claude-sonnet-4-7".to_string(), "kimi-k3".to_string());
-        mapping.insert("claude-sonnet-4-6".to_string(), "deepseek-v4-flash".to_string());
-        mapping.insert("claude-sonnet-4-5".to_string(), "deepseek-v4-flash".to_string());
-        mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-flash".to_string());
-        mapping.insert("claude-3-5-sonnet".to_string(), "deepseek-v4-flash".to_string());
+        mapping.insert(
+            "claude-sonnet-4-6".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        mapping.insert(
+            "claude-sonnet-4-5".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        mapping.insert(
+            "claude-sonnet-4".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        mapping.insert(
+            "claude-3-5-sonnet".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
         // Claude Haiku variants → v4-flash (lighter, cost-effective)
-        mapping.insert("claude-haiku-4-5".to_string(), "deepseek-v4-flash".to_string());
-        mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-flash".to_string());
-        mapping.insert("claude-3-haiku".to_string(), "deepseek-v4-flash".to_string());
+        mapping.insert(
+            "claude-haiku-4-5".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        mapping.insert(
+            "claude-haiku-4".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
+        mapping.insert(
+            "claude-3-haiku".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
         (mapping, "deepseek-v4-pro".to_string())
     }
 
@@ -368,6 +410,7 @@ impl Config {
                     m.insert("xhigh".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -393,6 +436,7 @@ impl Config {
                     m.insert("max".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -416,6 +460,7 @@ impl Config {
                     m.insert("xhigh".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -430,10 +475,8 @@ impl Config {
                 reasoning_enabled: true,
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
-                aliases: vec![
-                    "deepseek-chat".to_string(),
-                    "deepseek-reasoner".to_string(),
-                ],
+                aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+                wire_api: WireApi::ChatCompletions,
             },
             ModelProfile {
                 name: "deepseek-v4-flash".to_string(),
@@ -442,6 +485,7 @@ impl Config {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
                 aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
             },
             ModelProfile {
                 name: "glm-5.2".to_string(),
@@ -450,6 +494,7 @@ impl Config {
                 reasoning_replay: false,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
             },
             ModelProfile {
                 name: "kimi-k3".to_string(),
@@ -458,6 +503,7 @@ impl Config {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
             },
         ]
     }
@@ -562,6 +608,7 @@ aliases = []
                     m.insert("max".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -572,6 +619,7 @@ aliases = []
             reasoning_replay: false,
             toolcall_requires_reasoning: false,
             aliases: vec![],
+            wire_api: WireApi::ChatCompletions,
         }];
 
         let mut config = Config {
@@ -613,8 +661,90 @@ reasoning_enabled = true
         let providers = cf.providers.expect("providers should be Some");
         let fw = &providers["fireworks"];
         assert_eq!(fw.reasoning_field, "reasoning");
-        assert!(fw.thinking_param.is_none(), "thinking_param should be None for fireworks");
+        assert!(
+            fw.thinking_param.is_none(),
+            "thinking_param should be None for fireworks"
+        );
         assert!(fw.thinking_type_enabled.is_none());
         assert!(fw.thinking_type_disabled.is_none());
+    }
+
+    #[test]
+    fn wire_api_is_responses_only_for_gpt_profile_and_chat_by_default() {
+        let profiles = vec![
+            ModelProfile {
+                name: "gpt-5.6-luna".to_string(),
+                provider: "gpt".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: vec!["claude-sonnet-4-6".to_string()],
+                wire_api: WireApi::Responses,
+            },
+            ModelProfile {
+                name: "deepseek-v4-pro".to_string(),
+                provider: "deepseek".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: true,
+                aliases: vec!["deepseek-chat".to_string()],
+                wire_api: WireApi::ChatCompletions,
+            },
+            ModelProfile {
+                name: "glm-5.2".to_string(),
+                provider: "glm".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: false,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            },
+            ModelProfile {
+                name: "kimi-k3".to_string(),
+                provider: "moonshot".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            },
+        ];
+        let mut config = Config {
+            listen_addr: String::new(),
+            eswitch_url: String::new(),
+            api_key: String::new(),
+            log_level: String::new(),
+            model_mapping: HashMap::new(),
+            default_model: "deepseek-v4-pro".to_string(),
+            model_profiles: profiles,
+            providers: HashMap::new(),
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+
+        assert_eq!(
+            config.wire_api_for_model("gpt-5.6-luna"),
+            WireApi::Responses
+        );
+        assert_eq!(
+            config.wire_api_for_model("claude-sonnet-4-6"),
+            WireApi::Responses
+        );
+        assert_eq!(
+            config.wire_api_for_model("deepseek-chat"),
+            WireApi::ChatCompletions
+        );
+        assert_eq!(
+            config.wire_api_for_model("glm-5.2"),
+            WireApi::ChatCompletions
+        );
+        assert_eq!(
+            config.wire_api_for_model("kimi-k3"),
+            WireApi::ChatCompletions
+        );
+        assert_eq!(
+            config.wire_api_for_model("unlisted-model"),
+            WireApi::ChatCompletions
+        );
     }
 }

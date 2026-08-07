@@ -1,10 +1,9 @@
-use serde_json::Value;
 use crate::anthropic::types::{
-    MessagesResponse, ResponseContentBlock, Usage, SseEvent,
-    MessageStartData, ContentBlockStartData, ContentBlockDeltaData,
-    MessageDeltaData, StreamUsage,
+    ContentBlockDeltaData, ContentBlockStartData, MessageDeltaData, MessageStartData,
+    MessagesResponse, ResponseContentBlock, SseEvent, StreamUsage, Usage,
 };
 use crate::openai::types::{ChatCompletionResponse, ChatDelta};
+use serde_json::Value;
 
 /// Convert OpenAI non-streaming response to Anthropic format.
 pub fn convert_non_stream_response(
@@ -34,9 +33,7 @@ pub fn convert_non_stream_response(
         // 2. Text block
         if let Some(ref text) = msg.content {
             if !text.trim().is_empty() {
-                content.push(ResponseContentBlock::Text {
-                    text: text.clone(),
-                });
+                content.push(ResponseContentBlock::Text { text: text.clone() });
             }
         }
 
@@ -50,7 +47,10 @@ pub fn convert_non_stream_response(
                     .unwrap_or(Value::Null);
                 content.push(ResponseContentBlock::ToolUse {
                     id: tc.id.clone(),
-                    name: tc.function.as_ref().map_or("unknown".to_string(), |f| f.name.clone()),
+                    name: tc
+                        .function
+                        .as_ref()
+                        .map_or("unknown".to_string(), |f| f.name.clone()),
                     input,
                 });
             }
@@ -69,7 +69,9 @@ pub fn convert_non_stream_response(
             cache_creation_input_tokens: None,
         },
         |u| {
-            let cached = u.prompt_tokens_details.as_ref()
+            let cached = u
+                .prompt_tokens_details
+                .as_ref()
                 .and_then(|d| d.cached_tokens);
             let cache_creation = match (u.prompt_tokens, cached) {
                 (Some(p), Some(c)) if p > c => Some(p - c),
@@ -133,7 +135,11 @@ pub struct SseStateMachine {
 }
 
 impl SseStateMachine {
-    pub fn new(is_reasoning_model: bool, reasoning_field: String, reasoning_field_alt: Vec<String>) -> Self {
+    pub fn new(
+        is_reasoning_model: bool,
+        reasoning_field: String,
+        reasoning_field_alt: Vec<String>,
+    ) -> Self {
         Self {
             content_index: 0,
             text_started: false,
@@ -161,7 +167,9 @@ impl SseStateMachine {
         let mut events = Vec::new();
 
         // Handle usage-only chunks (no choices/delta)
-        let has_reasoning = delta.get_reasoning(&self.reasoning_field, &self.reasoning_field_alt).is_some();
+        let has_reasoning = delta
+            .get_reasoning(&self.reasoning_field, &self.reasoning_field_alt)
+            .is_some();
         if !has_reasoning
             && delta.content.is_none()
             && delta.tool_calls.is_none()
@@ -169,7 +177,9 @@ impl SseStateMachine {
         {
             if let Some(usage) = usage {
                 self.input_tokens = usage.prompt_tokens;
-                self.cached_tokens = usage.prompt_tokens_details.as_ref()
+                self.cached_tokens = usage
+                    .prompt_tokens_details
+                    .as_ref()
                     .and_then(|d| d.cached_tokens);
             }
             return events;
@@ -243,9 +253,7 @@ impl SseStateMachine {
                 self.current_text.push_str(text);
                 events.push(SseEvent::ContentBlockDelta {
                     index: self.content_index,
-                    delta: ContentBlockDeltaData::TextDelta {
-                        text: text.clone(),
-                    },
+                    delta: ContentBlockDeltaData::TextDelta { text: text.clone() },
                 });
             }
         }
@@ -293,7 +301,9 @@ impl SseStateMachine {
                     // id: from tc.id (call ID), name: from tc.function.name (tool name)
                     let call_id = tc.id.clone().unwrap_or_else(|| "unknown_call".to_string());
                     let tool_name = if let Some(ref func) = tc.function {
-                        func.name.clone().unwrap_or_else(|| "unknown_tool".to_string())
+                        func.name
+                            .clone()
+                            .unwrap_or_else(|| "unknown_tool".to_string())
                     } else {
                         "unknown_tool".to_string()
                     };
@@ -377,7 +387,7 @@ impl SseStateMachine {
         }
 
         // Message delta — prefer usage from the chunk, fall back to self state
-        let mapped_reason = stop_reason.map(|fr| map_finish_reason(fr));
+        let mapped_reason = stop_reason.map(map_finish_reason);
         let input_tokens = usage.and_then(|u| u.prompt_tokens).or(self.input_tokens);
         let cached_tokens = usage
             .and_then(|u| u.prompt_tokens_details.as_ref())
@@ -458,10 +468,22 @@ mod tests {
             }),
         };
 
-        let result = convert_non_stream_response(&openai_resp, "deepseek-v4", "msg_123", "reasoning_content", &[]);
+        let result = convert_non_stream_response(
+            &openai_resp,
+            "deepseek-v4",
+            "msg_123",
+            "reasoning_content",
+            &[],
+        );
         assert_eq!(result.content.len(), 2);
-        assert!(matches!(result.content[0], ResponseContentBlock::Thinking { .. }));
-        assert!(matches!(result.content[1], ResponseContentBlock::Text { .. }));
+        assert!(matches!(
+            result.content[0],
+            ResponseContentBlock::Thinking { .. }
+        ));
+        assert!(matches!(
+            result.content[1],
+            ResponseContentBlock::Text { .. }
+        ));
         assert_eq!(result.stop_reason, Some("end_turn".to_string()));
     }
 }

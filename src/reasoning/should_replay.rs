@@ -3,11 +3,7 @@ use crate::config::Config;
 /// Determines whether reasoning content should be replayed to the API.
 /// Now config-driven: checks ModelProfile.reasoning_replay instead of delegating
 /// to the old hardcoded requires_reasoning_content.
-pub fn should_replay_reasoning_content(
-    model: &str,
-    effort: Option<&str>,
-    config: &Config,
-) -> bool {
+pub fn should_replay_reasoning_content(model: &str, effort: Option<&str>, config: &Config) -> bool {
     // If effort is explicitly "off" / "disabled" / "none" / "false", don't replay
     if let Some(eff) = effort {
         let eff_lower = eff.to_lowercase();
@@ -50,6 +46,7 @@ mod tests {
                     m.insert("max".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -61,6 +58,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "glm-5.2".to_string(),
@@ -69,6 +67,7 @@ mod tests {
                 reasoning_replay: false,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
         ];
 

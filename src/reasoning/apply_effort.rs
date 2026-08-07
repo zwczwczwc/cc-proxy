@@ -1,9 +1,10 @@
-use serde_json::Value;
 use crate::config::ProviderConfig;
+use serde_json::Value;
 
 /// Applies reasoning_effort to the OpenAI request body.
 /// Now config-driven: uses ProviderConfig (effort_map, thinking_param, disable_thinking)
 /// instead of hardcoded provider match branches.
+#[allow(dead_code)]
 pub fn apply_reasoning_effort(body: &mut Value, effort: Option<&str>, provider: &ProviderConfig) {
     let effort = match effort {
         Some(e) => e.to_lowercase(),
@@ -82,6 +83,7 @@ mod tests {
                 m.insert("xhigh".to_string(), "max".to_string());
                 m
             },
+            responses_reasoning_summary: None,
         }
     }
 
@@ -103,6 +105,7 @@ mod tests {
                 m.insert("xhigh".to_string(), "max".to_string());
                 m
             },
+            responses_reasoning_summary: None,
         }
     }
 

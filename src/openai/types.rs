@@ -1,4 +1,4 @@
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,6 +58,10 @@ pub struct OpenAiFunction {
 // --- OpenAI Response types ---
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[expect(
+    dead_code,
+    reason = "response fields preserve upstream protocol compatibility"
+)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub choices: Vec<Choice>,
@@ -65,6 +69,10 @@ pub struct ChatCompletionResponse {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[expect(
+    dead_code,
+    reason = "choice fields preserve upstream protocol compatibility"
+)]
 pub struct Choice {
     pub index: u32,
     pub message: Option<ChatMessage>,
@@ -73,6 +81,10 @@ pub struct Choice {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[expect(
+    dead_code,
+    reason = "message fields preserve upstream protocol compatibility"
+)]
 pub struct ChatMessage {
     pub role: Option<String>,
     pub content: Option<String>,
@@ -155,6 +167,10 @@ impl ChatDelta {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[expect(
+    dead_code,
+    reason = "tool call type preserves upstream protocol compatibility"
+)]
 pub struct ToolCall {
     pub id: String,
     #[serde(rename = "type")]
@@ -163,6 +179,10 @@ pub struct ToolCall {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[expect(
+    dead_code,
+    reason = "tool call delta fields preserve upstream protocol compatibility"
+)]
 pub struct ToolCallDelta {
     pub index: Option<u32>,
     pub id: Option<String>,
@@ -190,6 +210,10 @@ pub struct PromptTokensDetails {
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
+#[expect(
+    dead_code,
+    reason = "usage fields preserve upstream protocol compatibility"
+)]
 pub struct Usage {
     pub prompt_tokens: Option<u32>,
     pub completion_tokens: Option<u32>,
@@ -200,7 +224,7 @@ pub struct Usage {
     /// DeepSeek: tokens NOT served from cache (billed at full price)
     #[serde(default)]
     pub prompt_cache_miss_tokens: Option<u32>,
-/// Standard OpenAI: cached tokens detail
+    /// Standard OpenAI: cached tokens detail
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
@@ -208,6 +232,10 @@ pub struct Usage {
 // --- Model list response ---
 
 #[derive(Debug, Clone, Serialize)]
+#[expect(
+    dead_code,
+    reason = "model listing types preserve endpoint compatibility"
+)]
 pub struct ModelListResponse {
     pub data: Vec<ModelInfo>,
 }
@@ -224,7 +252,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: None,
             reasoning: Some("kimi thinking".to_string()),
-                        tool_calls: None,
+            tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning", &[]);
         assert_eq!(result, Some("kimi thinking"));
@@ -238,7 +266,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: Some("deepseek thinking".to_string()),
             reasoning: None,
-                        tool_calls: None,
+            tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning_content", &[]);
         assert_eq!(result, Some("deepseek thinking"));
@@ -252,7 +280,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: Some("  ".to_string()), // whitespace only = empty
             reasoning: Some("alt thinking".to_string()),
-                        tool_calls: None,
+            tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning_content", &["reasoning".to_string()]);
         assert_eq!(result, Some("alt thinking"));
@@ -265,7 +293,7 @@ mod tests {
             content: Some("answer".to_string()),
             reasoning_content: None,
             reasoning: None,
-                        tool_calls: None,
+            tool_calls: None,
         };
         let result = msg.get_reasoning("reasoning_content", &["reasoning".to_string()]);
         assert_eq!(result, None);
@@ -278,7 +306,7 @@ mod tests {
             content: None,
             reasoning_content: None,
             reasoning: Some("stream thinking".to_string()),
-                        tool_calls: None,
+            tool_calls: None,
         };
         let result = delta.get_reasoning("reasoning", &[]);
         assert_eq!(result, Some("stream thinking"));

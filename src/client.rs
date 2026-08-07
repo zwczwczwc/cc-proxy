@@ -1,7 +1,8 @@
+use crate::openai::types::ChatCompletionRequest;
+use crate::responses::types::ResponsesRequest;
 use reqwest::Client;
 use serde_json::Value;
 use std::time::Duration;
-use crate::openai::types::ChatCompletionRequest;
 
 /// Sanitize error response body: truncate + redact sensitive fields.
 fn sanitize_error_body(body: &str) -> String {
@@ -41,10 +42,7 @@ impl DeepSeekClient {
     }
 
     /// Send a non-streaming chat completion request.
-    pub async fn chat_completion(
-        &self,
-        request: &ChatCompletionRequest,
-    ) -> anyhow::Result<Value> {
+    pub async fn chat_completion(&self, request: &ChatCompletionRequest) -> anyhow::Result<Value> {
         let url = format!("{}/v1/chat/completions", self.base_url);
 
         let response = self
@@ -105,5 +103,65 @@ impl DeepSeekClient {
             .await?;
 
         Ok(response.status().is_success())
+    }
+
+    pub async fn responses_completion(&self, request: &ResponsesRequest) -> anyhow::Result<Value> {
+        tracing::info!(
+            static_prefix_hash = %request.static_prefix_hash,
+            history_prefix_hash = %request.history_prefix_hash,
+            wire_input_hash = %request.wire_input_hash,
+            input_item_types = ?request.input_item_types,
+            synthetic_tail_present = request.synthetic_tail_present,
+            "Responses request telemetry"
+        );
+        let response = self
+            .client
+            .post(format!("{}/v1/responses", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(request)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "Responses API error ({}): {}",
+                status,
+                sanitize_error_body(&response.text().await.unwrap_or_default())
+            );
+        }
+        Ok(response.json().await?)
+    }
+
+    /// Send a streaming Responses API request and return the upstream SSE body.
+    pub async fn responses_completion_stream(
+        &self,
+        request: &ResponsesRequest,
+    ) -> anyhow::Result<impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>> {
+        tracing::info!(
+            static_prefix_hash = %request.static_prefix_hash,
+            history_prefix_hash = %request.history_prefix_hash,
+            wire_input_hash = %request.wire_input_hash,
+            input_item_types = ?request.input_item_types,
+            synthetic_tail_present = request.synthetic_tail_present,
+            "Responses stream request telemetry"
+        );
+        let response = self
+            .client
+            .post(format!("{}/v1/responses", self.base_url))
+            .header("Authorization", format!("Bearer {}", self.api_key))
+            .header("Content-Type", "application/json")
+            .json(request)
+            .send()
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            anyhow::bail!(
+                "Responses API error ({}): {}",
+                status,
+                sanitize_error_body(&response.text().await.unwrap_or_default())
+            );
+        }
+        Ok(response.bytes_stream())
     }
 }

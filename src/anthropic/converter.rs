@@ -1,48 +1,61 @@
-use serde_json::Value;
 use crate::anthropic::types::{MessagesRequest, SystemPrompt, Tool, ToolChoice};
 use crate::config::Config;
-use crate::openai::types::{ChatCompletionRequest, OpenAiTool, OpenAiFunction, StreamOptions, DeepSeekThinking};
-use crate::reasoning::sanitize::sanitize_thinking_mode_messages;
+use crate::openai::types::{
+    ChatCompletionRequest, DeepSeekThinking, OpenAiFunction, OpenAiTool, StreamOptions,
+};
 use crate::reasoning::build_messages::build_chat_messages_with_reasoning;
-use crate::reasoning::requires::requires_reasoning_content;
 use crate::reasoning::prefix::compute_prefix_fingerprint;
+use crate::reasoning::requires::requires_reasoning_content;
+use crate::reasoning::sanitize::sanitize_thinking_mode_messages;
+use serde_json::Value;
 
 /// Map Claude model names to upstream model names using the config's model_mapping
 /// and model_profiles. The `[1m]` suffix is stripped before lookup.
 /// If the model is a known profile (or alias), it passes through directly.
 /// Unknown models fall back to config's default_model.
+pub fn map_model_to_upstream_for_responses(model: &str, config: &Config) -> String {
+    map_model_to_upstream(model, config)
+}
+
 fn map_model_to_upstream(model: &str, config: &Config) -> String {
     let clean = model.trim_end_matches("[1m]").trim();
     // Check if it's already a known upstream model (profile or alias) — pass through
     if config.model_profile(clean).is_some() {
         return clean.to_string();
     }
-config.model_mapping.get(clean).cloned().unwrap_or_else(|| config.default_model.clone())
+    config
+        .model_mapping
+        .get(clean)
+        .cloned()
+        .unwrap_or_else(|| config.default_model.clone())
 }
 
 /// Convert Anthropic MessagesRequest to OpenAI ChatCompletionRequest.
-pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ChatCompletionRequest> {
+pub fn convert_request(
+    req: &MessagesRequest,
+    config: &Config,
+) -> anyhow::Result<ChatCompletionRequest> {
     let model = req.model.clone();
     // Map Claude model names to upstream model names for eswitch
     let upstream_model = map_model_to_upstream(&model, config);
     let is_reasoning_model = requires_reasoning_content(&upstream_model, config);
 
     // Determine effort level from thinking config for replay decision
-    let effort_for_replay = req.thinking.as_ref().and_then(|t| {
+    let effort_for_replay = req.thinking.as_ref().map(|t| {
         if t.is_enabled() {
             let budget = t.budget_tokens().unwrap_or(0);
             if budget >= 4096 || budget == 0 {
-                Some("max")
+                "max"
             } else {
-                Some("high")
+                "high"
             }
         } else {
-            Some("off")
+            "off"
         }
     });
     let include_reasoning = crate::reasoning::should_replay::should_replay_reasoning_content(
         &upstream_model,
-        effort_for_replay.as_deref(),
+        effort_for_replay,
         config,
     );
 
@@ -51,7 +64,10 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     // to stabilise KV cache prefix across turns.
     // Controlled by env var CODEMERMAFROST_RELOCATE.
     let (system, messages_ref) = if std::env::var("CODEMERMAFROST_RELOCATE").is_ok() {
-        let raw_system = req.system.clone().unwrap_or(SystemPrompt::Text(String::new()));
+        let raw_system = req
+            .system
+            .clone()
+            .unwrap_or(SystemPrompt::Text(String::new()));
         // Step 1: stabilize billing nonce (permafrost_align.py L149-L177)
         let system = crate::reasoning::relocate::stabilize_metadata(raw_system);
         // Step 2: relocate volatile env blocks (permafrost_align.py L248-L310)
@@ -70,11 +86,8 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     } else {
         (req.system.clone(), req.messages.clone())
     };
-    let messages = build_chat_messages_with_reasoning(
-        system.as_ref(),
-        &messages_ref,
-        include_reasoning,
-    );
+    let messages =
+        build_chat_messages_with_reasoning(system.as_ref(), &messages_ref, include_reasoning);
 
     let stream = req.stream.unwrap_or(false);
 
@@ -85,7 +98,9 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
         max_completion_tokens: Some(req.max_tokens),
         stream: Some(stream),
         stream_options: if stream {
-            Some(StreamOptions { include_usage: true })
+            Some(StreamOptions {
+                include_usage: true,
+            })
         } else {
             None
         },
@@ -100,10 +115,7 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
 
     // Convert tools (sorted by name for KV cache prefix stability)
     if let Some(tools) = &req.tools {
-        let mut openai_tools: Vec<OpenAiTool> = tools
-            .iter()
-            .map(|t| convert_tool(t))
-            .collect();
+        let mut openai_tools: Vec<OpenAiTool> = tools.iter().map(convert_tool).collect();
         openai_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
         openai_req.tools = Some(openai_tools);
     }
@@ -116,22 +128,28 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     // Apply reasoning effort from thinking config
     // ★gpt provider + tools 互斥处理：gpt-5.6 拒绝 reasoning_effort+tools
     let profile = config.model_profile(&openai_req.model);
-    let is_gpt_provider = profile
-        .map(|p| p.provider == "gpt")
-        .unwrap_or(false);
+    let is_gpt_provider = profile.map(|p| p.provider == "gpt").unwrap_or(false);
     let has_tools = openai_req.tools.is_some();
 
     if let Some(thinking) = &req.thinking {
         if thinking.is_enabled() {
             // Default all thinking-enabled requests to xhigh effort.
             let effort = "xhigh";
-            let effort = if is_gpt_provider && has_tools { "off" } else { effort };
+            let effort = if is_gpt_provider && has_tools {
+                "off"
+            } else {
+                effort
+            };
             apply_effort_direct(&mut openai_req, effort, config);
         } else {
             apply_effort_direct(&mut openai_req, "off", config);
         }
     } else if is_reasoning_model {
-        let effort = if is_gpt_provider && has_tools { "off" } else { "xhigh" };
+        let effort = if is_gpt_provider && has_tools {
+            "off"
+        } else {
+            "xhigh"
+        };
         apply_effort_direct(&mut openai_req, effort, config);
     }
 
@@ -151,7 +169,9 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
 
     // F6 (simplified): Per-request prefix fingerprint for KV cache observability.
     // No cross-request comparison — external monitoring aggregates and analyses.
-    let sys_prompt = openai_req.messages.first()
+    let sys_prompt = openai_req
+        .messages
+        .first()
         .and_then(|m| m.get("content").and_then(|v| v.as_str()))
         .unwrap_or("");
     let fingerprint = compute_prefix_fingerprint(sys_prompt, openai_req.tools.as_deref());
@@ -175,7 +195,7 @@ fn apply_effort_direct(req: &mut ChatCompletionRequest, effort: &str, config: &C
 
     match effort {
         "off" | "disabled" | "none" | "false" => {
-if let Some(prov) = provider {
+            if let Some(prov) = provider {
                 if prov.disable_thinking {
                     // Cannot turn off thinking; set to lowest effort
                     let lowest = prov
@@ -264,15 +284,20 @@ fn convert_tool_choice(tc: &ToolChoice) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
-    use crate::anthropic::types::{ContentBlock, ContentValue, Message, SystemContentBlock, SystemPrompt, ThinkingConfig};
+    use crate::anthropic::types::{
+        ContentBlock, ContentValue, Message, SystemContentBlock, SystemPrompt, ThinkingConfig,
+    };
     use crate::config::ProviderConfig;
+    use std::collections::HashMap;
 
     /// Helper to create a minimal Config for tests.
     fn test_config() -> Config {
         let mut mapping = HashMap::new();
         mapping.insert("claude-opus-4".to_string(), "deepseek-v4-pro".to_string());
-        mapping.insert("claude-sonnet-4".to_string(), "deepseek-v4-flash".to_string());
+        mapping.insert(
+            "claude-sonnet-4".to_string(),
+            "deepseek-v4-flash".to_string(),
+        );
         mapping.insert("claude-haiku-4".to_string(), "deepseek-v4-pro".to_string());
 
         let mut providers = HashMap::new();
@@ -295,6 +320,7 @@ mod tests {
                     m.insert("xhigh".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
         providers.insert(
@@ -316,6 +342,7 @@ mod tests {
                     m.insert("xhigh".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
         providers.insert(
@@ -339,6 +366,7 @@ mod tests {
                     m.insert("max".to_string(), "max".to_string());
                     m
                 },
+                responses_reasoning_summary: None,
             },
         );
 
@@ -350,6 +378,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
                 aliases: vec!["deepseek-chat".to_string(), "deepseek-reasoner".to_string()],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "deepseek-v4-flash".to_string(),
@@ -358,6 +387,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: true,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "kimi-k3".to_string(),
@@ -366,6 +396,7 @@ mod tests {
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
             crate::config::ModelProfile {
                 name: "glm-5.2".to_string(),
@@ -374,6 +405,7 @@ mod tests {
                 reasoning_replay: false,
                 toolcall_requires_reasoning: false,
                 aliases: vec![],
+                wire_api: crate::config::WireApi::ChatCompletions,
             },
         ];
 
@@ -574,7 +606,10 @@ mod tests {
         let result = convert_request(&req, &config).unwrap();
         // Kimi K3: reasoning_effort is set, but NO thinking.type
         assert_eq!(result.reasoning_effort, Some("max".to_string()));
-        assert!(result.thinking.is_none(), "Kimi K3 should not have thinking.type");
+        assert!(
+            result.thinking.is_none(),
+            "Kimi K3 should not have thinking.type"
+        );
     }
 
     #[test]
@@ -604,7 +639,10 @@ mod tests {
         let result = convert_request(&req, &config).unwrap();
         // Kimi K3 can't turn off thinking → lowest effort
         assert_eq!(result.reasoning_effort, Some("low".to_string()));
-        assert!(result.thinking.is_none(), "Kimi K3 should not have thinking.type");
+        assert!(
+            result.thinking.is_none(),
+            "Kimi K3 should not have thinking.type"
+        );
     }
 
     #[test]
@@ -636,7 +674,10 @@ mod tests {
 
         let result = convert_request(&req, &config).unwrap();
         assert_eq!(result.reasoning_effort, Some("max".to_string()));
-        assert!(result.thinking.is_none(), "Kimi K3 should not have thinking.type");
+        assert!(
+            result.thinking.is_none(),
+            "Kimi K3 should not have thinking.type"
+        );
     }
 
     #[test]
@@ -725,12 +766,13 @@ mod tests {
         // glm-5.2 has reasoning_replay=false, so even with enabled thinking,
         // reasoning_content should NOT be included in messages
         // (check: messages should not have reasoning_content field)
-        let _asst_msg = result.messages.iter().find(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        });
+        let _asst_msg = result
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"));
         // If there are no assistant messages, that's fine — the test just has a user message
-        // The key assertion: reasoning_effort is set correctly
-        assert_eq!(result.reasoning_effort, Some("max".to_string()));
+        // Responses transport uses xhigh directly; Chat provider mappings remain unchanged.
+        assert_eq!(result.reasoning_effort, Some("xhigh".to_string()));
         assert_eq!(result.thinking.as_ref().unwrap().thinking_type, "enabled");
     }
 
@@ -902,9 +944,11 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
-        let asst_msg = result.messages.iter().find(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        }).unwrap();
+        let asst_msg = result
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .unwrap();
         let reasoning = asst_msg.get("reasoning_content").and_then(|v| v.as_str());
         assert_eq!(reasoning, Some("Let me think about this."));
     }
@@ -948,11 +992,16 @@ mod tests {
         };
 
         let result = convert_request(&req, &config).unwrap();
-        let asst_msg = result.messages.iter().find(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        }).unwrap();
+        let asst_msg = result
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .unwrap();
         // No reasoning_content when thinking is disabled
-        assert!(asst_msg.get("reasoning_content").and_then(|v| v.as_str()).is_none());
+        assert!(asst_msg
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .is_none());
         assert_eq!(asst_msg["content"], "Here is the answer.");
     }
 
@@ -1113,10 +1162,15 @@ mod tests {
         let result = convert_request(&req, &config).unwrap();
 
         // System should STILL contain env (relocate disabled)
-        let sys_msg = result.messages.iter().find(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("system")
-        }).unwrap();
-        let sys_content = sys_msg.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let sys_msg = result
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("system"))
+            .unwrap();
+        let sys_content = sys_msg
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         assert!(
             sys_content.contains("<env>"),
             "Without relocate, system should contain env block.\nGot: {}",
@@ -1124,9 +1178,11 @@ mod tests {
         );
 
         // BUT reasoning should still be replayed
-        let asst_msg = result.messages.iter().find(|m| {
-            m.get("role").and_then(|v| v.as_str()) == Some("assistant")
-        }).unwrap();
+        let asst_msg = result
+            .messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .unwrap();
         let reasoning = asst_msg.get("reasoning_content").and_then(|v| v.as_str());
         assert_eq!(
             reasoning,

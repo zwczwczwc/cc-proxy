@@ -19,24 +19,22 @@ pub fn sanitize_thinking_mode_messages(body: &mut Value) {
             continue;
         }
 
-        let has_tool_calls = msg.get("tool_calls").map_or(false, |v| !v.is_null());
+        let has_tool_calls = msg.get("tool_calls").is_some_and(|v| !v.is_null());
 
         if !has_tool_calls {
             continue;
         }
 
-        let has_reasoning = msg
-            .get("reasoning_content")
-            .map_or(false, |v| {
-                if v.is_null() {
-                    return false;
-                }
-                if let Some(s) = v.as_str() {
-                    return !s.trim().is_empty();
-                }
-                // If it's some other non-null value, treat as having reasoning
-                true
-            });
+        let has_reasoning = msg.get("reasoning_content").is_some_and(|v| {
+            if v.is_null() {
+                return false;
+            }
+            if let Some(s) = v.as_str() {
+                return !s.trim().is_empty();
+            }
+            // If it's some other non-null value, treat as having reasoning
+            true
+        });
 
         if !has_reasoning {
             msg["reasoning_content"] = serde_json::Value::String("(reasoning omitted)".to_string());
