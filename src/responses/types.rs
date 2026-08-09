@@ -4,6 +4,8 @@ use serde_json::Value;
 #[derive(Debug, Clone, Serialize)]
 pub struct ResponsesRequest {
     pub model: String,
+    #[serde(skip)]
+    pub request_id: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub instructions: Option<String>,
     pub input: Vec<Value>,

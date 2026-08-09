@@ -5,6 +5,7 @@ use crate::anthropic::types::{
 use crate::config::Config;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ResponsesRequest> {
     convert_request_with_relocation(
@@ -94,6 +95,7 @@ fn convert_request_with_relocation(
     );
     Ok(ResponsesRequest {
         model,
+        request_id: Uuid::new_v4().simple().to_string(),
         instructions,
         input,
         tools,

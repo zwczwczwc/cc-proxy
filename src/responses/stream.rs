@@ -531,10 +531,12 @@ impl State {
 pub fn process_stream(
     model: String,
     msg_id: String,
+    request_id: String,
     body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(256);
     let stats_model = model.clone();
+    let telemetry_request_id = request_id.clone();
     tokio::spawn(async move {
         use futures_util::StreamExt;
         let mut state = State::new();
@@ -566,6 +568,12 @@ pub fn process_stream(
                             },
                         }))
                         .await;
+                    tracing::warn!(
+                        request_id = %telemetry_request_id,
+                        elapsed_ms = 0u64,
+                        error = %error,
+                        "Responses stream downstream conversion error"
+                    );
                     return;
                 }
             };
@@ -615,6 +623,11 @@ pub fn process_stream(
                                 .unwrap_or("incomplete"),
                         );
                     }
+                    tracing::info!(
+                        request_id = %telemetry_request_id,
+                        terminal_event = %event_type.unwrap_or("unknown"),
+                        "Responses stream terminal event"
+                    );
                     for event in state.finish() {
                         let _ = tx.send(axum_event(&event)).await;
                     }
@@ -668,6 +681,10 @@ pub fn process_stream(
                 },
             }))
             .await;
+        tracing::warn!(
+            request_id = %telemetry_request_id,
+            "Responses stream EOF without terminal event"
+        );
     });
     Sse::new(EventStream(rx))
 }
