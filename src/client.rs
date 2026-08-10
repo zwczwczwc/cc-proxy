@@ -1,8 +1,9 @@
 use crate::openai::types::ChatCompletionRequest;
 use crate::responses::types::ResponsesRequest;
+use reqwest::header::{CONTENT_LENGTH, CONTENT_TYPE, TRANSFER_ENCODING};
 use reqwest::Client;
 use serde_json::Value;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Sanitize error response body: truncate + redact sensitive fields.
 fn sanitize_error_body(body: &str) -> String {
@@ -106,7 +107,9 @@ impl DeepSeekClient {
     }
 
     pub async fn responses_completion(&self, request: &ResponsesRequest) -> anyhow::Result<Value> {
+        let started_at = Instant::now();
         tracing::info!(
+            request_id = %request.request_id,
             static_prefix_hash = %request.static_prefix_hash,
             history_prefix_hash = %request.history_prefix_hash,
             wire_input_hash = %request.wire_input_hash,
@@ -122,15 +125,42 @@ impl DeepSeekClient {
             .json(request)
             .send()
             .await?;
+        let headers_at = started_at.elapsed();
         let status = response.status();
+        tracing::info!(
+            request_id = %request.request_id,
+            upstream_http_status = status.as_u16(),
+            headers_elapsed_ms = headers_at.as_millis() as u64,
+            response_content_type = ?response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            response_content_length = ?response.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            response_transfer_encoding = ?response.headers().get(TRANSFER_ENCODING).and_then(|v| v.to_str().ok()),
+            "Responses response headers"
+        );
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                request_id = %request.request_id,
+                upstream_http_status = status.as_u16(),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error_body_len = body.len(),
+                "Responses upstream request failed"
+            );
             anyhow::bail!(
                 "Responses API error ({}): {}",
                 status,
-                sanitize_error_body(&response.text().await.unwrap_or_default())
+                sanitize_error_body(&body)
             );
         }
-        Ok(response.json().await?)
+        let body: Value = response.json().await?;
+        tracing::info!(
+            request_id = %request.request_id,
+            elapsed_ms = started_at.elapsed().as_millis() as u64,
+            terminal_status = ?body
+                .get("status")
+                .and_then(|value| value.as_str()),
+            "Responses non-stream completed"
+        );
+        Ok(body)
     }
 
     /// Send a streaming Responses API request and return the upstream SSE body.
@@ -138,7 +168,9 @@ impl DeepSeekClient {
         &self,
         request: &ResponsesRequest,
     ) -> anyhow::Result<impl futures_util::Stream<Item = reqwest::Result<bytes::Bytes>>> {
+        let started_at = Instant::now();
         tracing::info!(
+            request_id = %request.request_id,
             static_prefix_hash = %request.static_prefix_hash,
             history_prefix_hash = %request.history_prefix_hash,
             wire_input_hash = %request.wire_input_hash,
@@ -154,14 +186,74 @@ impl DeepSeekClient {
             .json(request)
             .send()
             .await?;
+        let headers_at = started_at.elapsed();
         let status = response.status();
+        tracing::info!(
+            request_id = %request.request_id,
+            upstream_http_status = status.as_u16(),
+            headers_elapsed_ms = headers_at.as_millis() as u64,
+            response_content_type = ?response.headers().get(CONTENT_TYPE).and_then(|v| v.to_str().ok()),
+            response_content_length = ?response.headers().get(CONTENT_LENGTH).and_then(|v| v.to_str().ok()),
+            response_transfer_encoding = ?response.headers().get(TRANSFER_ENCODING).and_then(|v| v.to_str().ok()),
+            "Responses stream response headers"
+        );
         if !status.is_success() {
+            let body = response.text().await.unwrap_or_default();
+            tracing::warn!(
+                request_id = %request.request_id,
+                upstream_http_status = status.as_u16(),
+                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                error_body_len = body.len(),
+                "Responses stream upstream request failed"
+            );
             anyhow::bail!(
                 "Responses API error ({}): {}",
                 status,
-                sanitize_error_body(&response.text().await.unwrap_or_default())
+                sanitize_error_body(&body)
             );
         }
-        Ok(response.bytes_stream())
+        let request_id = request.request_id.clone();
+        let first_byte = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let first_byte_at = started_at;
+        let bytes = response.bytes_stream();
+        Ok(Box::pin(futures_util::stream::unfold(
+            (bytes, first_byte, first_byte_at),
+            move |(mut bytes, first_byte, started_at)| {
+                let request_id = request_id.clone();
+                async move {
+                    use futures_util::StreamExt;
+                    match bytes.next().await {
+                        Some(Ok(chunk)) => {
+                            if !first_byte.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                                tracing::info!(
+                                    request_id = %request_id,
+                                    first_byte_elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                    first_byte_len = chunk.len(),
+                                    "Responses stream first byte"
+                                );
+                            }
+                            Some((Ok(chunk), (bytes, first_byte, started_at)))
+                        }
+                        Some(Err(error)) => {
+                            tracing::warn!(
+                                request_id = %request_id,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                error = %error,
+                                "Responses stream upstream read error"
+                            );
+                            Some((Err(error), (bytes, first_byte, started_at)))
+                        }
+                        None => {
+                            tracing::info!(
+                                request_id = %request_id,
+                                elapsed_ms = started_at.elapsed().as_millis() as u64,
+                                "Responses stream upstream EOF"
+                            );
+                            None
+                        }
+                    }
+                }
+            },
+        )))
     }
 }

@@ -70,8 +70,13 @@ async fn handle_messages(
                 Ok(stream) => stream,
                 Err(e) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
             };
-            return crate::responses::stream::process_stream(upstream_model, msg_id, byte_stream)
-                .into_response();
+            return crate::responses::stream::process_stream(
+                upstream_model,
+                msg_id,
+                responses_req.request_id.clone(),
+                byte_stream,
+            )
+            .into_response();
         }
         return match client.responses_completion(&responses_req).await {
             Ok(value) => match serde_json::from_value::<crate::responses::types::ResponsesResponse>(value) {
