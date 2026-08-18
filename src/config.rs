@@ -99,6 +99,11 @@ pub struct Config {
     pub default_model: String,
     pub model_profiles: Vec<ModelProfile>,
     pub providers: HashMap<String, ProviderConfig>,
+    /// Official Moonshot (Kimi For Coding) upstream base URL, no path suffix
+    /// (client appends /v1/chat_completions etc.). Env: MOONSHOT_OFFICIAL_URL.
+    pub moonshot_official_url: String,
+    /// Official Moonshot API key. Env: MOONSHOT_OFFICIAL_API_KEY.
+    pub moonshot_official_api_key: String,
     /// Index: model name (or alias) → index into model_profiles
     pub(crate) profile_by_name: HashMap<String, usize>,
 }
@@ -113,6 +118,10 @@ impl Config {
                 .unwrap_or_else(|_| "http://127.0.0.1:11434".to_string()),
             api_key: env::var("DEEPSEEK_API_KEY").unwrap_or_else(|_| "not-needed".to_string()),
             log_level: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
+            moonshot_official_url: env::var("MOONSHOT_OFFICIAL_URL")
+                .unwrap_or_else(|_| "https://api.kimi.com/coding".to_string()),
+            moonshot_official_api_key: env::var("MOONSHOT_OFFICIAL_API_KEY")
+                .unwrap_or_default(),
             model_mapping,
             default_model,
             model_profiles,
@@ -625,6 +634,8 @@ aliases = []
         let mut config = Config {
             listen_addr: "0.0.0.0:11435".to_string(),
             eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
             api_key: "test".to_string(),
             log_level: "info".to_string(),
             model_mapping: HashMap::new(),
@@ -712,6 +723,8 @@ reasoning_enabled = true
         let mut config = Config {
             listen_addr: String::new(),
             eswitch_url: String::new(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
             api_key: String::new(),
             log_level: String::new(),
             model_mapping: HashMap::new(),

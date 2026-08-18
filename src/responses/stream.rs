@@ -547,7 +547,15 @@ pub fn process_stream(
                 role: "assistant".to_string(),
                 content: Vec::new(),
                 model,
-                usage: None,
+                // usage 必须为对象而非 null：Claude Code 的 Agent 工具会读取
+                // message_start.message.usage.input_tokens，null 会直接崩溃
+                //（"null is not an object (evaluating 'o.input_tokens')"）。
+                usage: Some(StreamUsage {
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
+                }),
             },
         };
         if tx.send(axum_event(&start)).await.is_err() {

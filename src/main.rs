@@ -30,6 +30,13 @@ async fn main() -> anyhow::Result<()> {
         config.eswitch_url.clone(),
         config.api_key.clone(),
     ));
+    let official_client = Arc::new(client::DeepSeekClient::new(
+        config.moonshot_official_url.clone(),
+        config.moonshot_official_api_key.clone(),
+    ));
+    if config.moonshot_official_api_key.is_empty() {
+        tracing::warn!("MOONSHOT_OFFICIAL_API_KEY is empty: moonshot-official provider requests will fail upstream auth");
+    }
 
     // Health check upstream
     match client.health_check().await {
@@ -38,7 +45,7 @@ async fn main() -> anyhow::Result<()> {
         Err(e) => tracing::warn!("eswitch health check error: {}", e),
     }
 
-    let app = routes::create_router(client, config.clone())
+    let app = routes::create_router(client, official_client, config.clone())
         .layer(DefaultBodyLimit::max(32 * 1024 * 1024))
         .layer(
             CorsLayer::new()

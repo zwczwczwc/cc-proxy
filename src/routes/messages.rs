@@ -44,14 +44,37 @@ fn get_reasoning_fields(model: &str, config: &Config) -> (String, Vec<String>) {
     )
 }
 
-pub fn routes(client: Arc<DeepSeekClient>, config: Arc<Config>) -> Router {
+pub fn routes(
+    client: Arc<DeepSeekClient>,
+    official_client: Arc<DeepSeekClient>,
+    config: Arc<Config>,
+) -> Router {
     Router::new()
         .route("/v1/messages", post(handle_messages))
-        .with_state((client, config))
+        .with_state((client, official_client, config))
+}
+
+/// Select the upstream client for a model: profiles bound to provider
+/// "moonshot-official" go to the official Moonshot (Kimi For Coding) upstream;
+/// everything else goes to the default eswitch upstream.
+fn select_client<'a>(
+    model: &str,
+    config: &Config,
+    client: &'a Arc<DeepSeekClient>,
+    official_client: &'a Arc<DeepSeekClient>,
+) -> &'a Arc<DeepSeekClient> {
+    match config.model_profile(model) {
+        Some(profile) if profile.provider == "moonshot-official" => official_client,
+        _ => client,
+    }
 }
 
 async fn handle_messages(
-    State((client, config)): State<(Arc<DeepSeekClient>, Arc<Config>)>,
+    State((client, official_client, config)): State<(
+        Arc<DeepSeekClient>,
+        Arc<DeepSeekClient>,
+        Arc<Config>,
+    )>,
     Json(req): Json<MessagesRequest>,
 ) -> Response {
     let model = req.model.clone();
@@ -60,13 +83,14 @@ async fn handle_messages(
 
     let upstream_model =
         crate::anthropic::converter::map_model_to_upstream_for_responses(&model, &config);
+    let upstream_client = select_client(&upstream_model, &config, &client, &official_client);
     if config.wire_api_for_model(&upstream_model) == WireApi::Responses {
         let responses_req = match crate::responses::convert_request(&req, &config) {
             Ok(request) => request,
             Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":e.to_string()}}))).into_response(),
         };
         if stream {
-            let byte_stream = match client.responses_completion_stream(&responses_req).await {
+            let byte_stream = match upstream_client.responses_completion_stream(&responses_req).await {
                 Ok(stream) => stream,
                 Err(e) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
             };
@@ -78,7 +102,7 @@ async fn handle_messages(
             )
             .into_response();
         }
-        return match client.responses_completion(&responses_req).await {
+        return match upstream_client.responses_completion(&responses_req).await {
             Ok(value) => match serde_json::from_value::<crate::responses::types::ResponsesResponse>(value) {
                 Ok(response) => match crate::responses::convert_response(&response, &upstream_model, &msg_id) { Ok(result) => (StatusCode::OK, Json(result)).into_response(), Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response() },
                 Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
@@ -111,7 +135,7 @@ async fn handle_messages(
         // Streaming response — retry on connection failure
         let mut retries = 0;
         let byte_stream = loop {
-            match client.chat_completion_stream(&openai_req).await {
+            match upstream_client.chat_completion_stream(&openai_req).await {
                 Ok(s) => break s,
                 Err(e) if retries < max_retries => {
                     retries += 1;
@@ -154,7 +178,7 @@ async fn handle_messages(
         // Non-streaming response — retry on connection failure
         let mut retries = 0;
         let openai_resp = loop {
-            match client.chat_completion(&openai_req).await {
+            match upstream_client.chat_completion(&openai_req).await {
                 Ok(r) => break r,
                 Err(e) if retries < max_retries => {
                     retries += 1;

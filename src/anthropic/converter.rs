@@ -420,6 +420,8 @@ mod tests {
         Config {
             listen_addr: "0.0.0.0:11435".to_string(),
             eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
             api_key: "test-key".to_string(),
             log_level: "info".to_string(),
             model_mapping: mapping,
