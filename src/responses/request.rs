@@ -331,6 +331,8 @@ mod tests {
         let config = Config {
             listen_addr: String::new(),
             eswitch_url: String::new(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
             api_key: String::new(),
             log_level: String::new(),
             model_mapping: HashMap::new(),
