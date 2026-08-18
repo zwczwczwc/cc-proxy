@@ -27,6 +27,7 @@
 
 use crate::openai::types::Usage as ChatUsage;
 use crate::responses::types::ResponsesUsage;
+use serde::{Deserialize, Serialize};
 
 /// Which upstream usage shape produced a `CacheStats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -57,6 +58,64 @@ pub(crate) struct CacheStats {
     pub(crate) cache_write_tokens: Option<u32>,
     pub(crate) cache_miss_tokens: Option<u32>,
     pub(crate) source: CacheSource,
+}
+
+// ---------------------------------------------------------------------------
+// Declarative cache policy (default-off).
+//
+// Phase 2b.1 scope: define the type surface and default-off serde semantics
+// only. Nothing here is wired into production logs or outbound wire behavior —
+// `ProviderConfig.cache_policy` defaults to `None` for every built-in provider
+// and no config.toml declares a policy, so every legacy path is preserved.
+// Opt-in happens in later phases (2b.2+, Phase 3).
+// ---------------------------------------------------------------------------
+
+/// Where cache-usage telemetry should be sourced from for a provider.
+///
+/// `Off` (the default) means no cache-usage telemetry. Every other variant is
+/// a named upstream field that a later phase's selector maps into
+/// [`CacheStats`]. Variants are additive; a provider that has not opted in
+/// stays `Off`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum UsagePolicy {
+    /// No cache-usage telemetry (default).
+    #[default]
+    Off,
+    /// Kimi top-level `usage.cached_tokens`.
+    TopLevelCachedTokens,
+}
+
+/// Declarative cache policy attached to a provider via
+/// [`crate::config::ProviderConfig::cache_policy`].
+///
+/// Every field is `#[serde(default)]` and the whole policy is an `Option` on
+/// the provider, so a missing policy — or a policy missing fields — is
+/// equivalent to "cache behavior fully off".
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct CachePolicy {
+    /// Where cache-usage telemetry comes from. `Off` (default) = disabled.
+    pub usage: UsagePolicy,
+    /// Optional upstream binding name. `Some("official")` binds this provider
+    /// to the official Moonshot (Kimi For Coding) upstream; `None` keeps the
+    /// default (eswitch) routing. Phase 3 canonicalizes provider names and
+    /// replaces the `select_client` string match with this binding.
+    pub upstream: Option<String>,
+}
+
+impl CachePolicy {
+    /// Whether this policy opts into cache-usage telemetry.
+    ///
+    /// `cache_usage_enabled() == false` is the default; a provider only reports
+    /// cache usage once its policy names a concrete usage source.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "usage selector; wired in a later phase")
+    )]
+    pub fn cache_usage_enabled(&self) -> bool {
+        !matches!(self.usage, UsagePolicy::Off)
+    }
 }
 
 /// Map an OpenAI-compatible chat completions `Usage` into `CacheStats`.
@@ -411,6 +470,68 @@ mod tests {
                 .filter(|stats| stats.cache_write_tokens.is_some())
                 .count(),
             1
+        );
+    }
+
+    // --- default-off cache policy contract ---
+
+    #[test]
+    fn cache_policy_default_is_fully_off() {
+        let policy = CachePolicy::default();
+        assert_eq!(policy.usage, UsagePolicy::Off);
+        assert_eq!(policy.upstream, None);
+        assert!(
+            !policy.cache_usage_enabled(),
+            "default policy must not opt into cache-usage telemetry"
+        );
+        // UsagePolicy default is Off (the serde default source).
+        assert_eq!(UsagePolicy::default(), UsagePolicy::Off);
+    }
+
+    #[test]
+    fn cache_usage_enabled_follows_usage_source() {
+        let enabled = CachePolicy {
+            usage: UsagePolicy::TopLevelCachedTokens,
+            upstream: None,
+        };
+        assert!(enabled.cache_usage_enabled());
+
+        let binding_only = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+        };
+        assert!(
+            !binding_only.cache_usage_enabled(),
+            "an upstream binding without a usage source is still cache-off"
+        );
+    }
+
+    #[test]
+    fn cache_policy_serde_missing_fields_default_off() {
+        // Empty JSON object -> every field defaults off.
+        let policy: CachePolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(policy.usage, UsagePolicy::Off);
+        assert_eq!(policy.upstream, None);
+
+        // Unknown fields are ignored (forward-compat with later phases).
+        let policy: CachePolicy =
+            serde_json::from_str(r#"{"usage":"top_level_cached_tokens","unknown_future":"x"}"#)
+                .unwrap();
+        assert_eq!(policy.usage, UsagePolicy::TopLevelCachedTokens);
+    }
+
+    #[test]
+    fn cache_policy_serde_roundtrip() {
+        let policy = CachePolicy {
+            usage: UsagePolicy::TopLevelCachedTokens,
+            upstream: Some("official".to_string()),
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, policy);
+        assert_eq!(
+            json,
+            r#"{"usage":"top_level_cached_tokens","upstream":"official"}"#
         );
     }
 }

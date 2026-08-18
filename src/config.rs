@@ -1,3 +1,4 @@
+use crate::cache::CachePolicy;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::env;
@@ -46,6 +47,12 @@ pub struct ProviderConfig {
     /// This is response control and is excluded from cache identity hashes.
     #[serde(default)]
     pub responses_reasoning_summary: Option<String>,
+    /// Declarative cache policy. `None` (default) = all cache behavior off.
+    /// Old configs that omit this field parse identically (`Option` defaults
+    /// to `None`); serde ignores unknown fields, so existing config.toml
+    /// files need no change.
+    #[serde(default)]
+    pub cache_policy: Option<CachePolicy>,
 }
 
 /// Per-model behavioral profile.
@@ -107,6 +114,11 @@ pub struct Config {
     /// Index: model name (or alias) → index into model_profiles
     pub(crate) profile_by_name: HashMap<String, usize>,
 }
+
+/// Recognized upstream binding names for `CachePolicy.upstream`.
+/// `None` (default) keeps eswitch routing. Phase 3 provider canonicalization
+/// may extend this set.
+const KNOWN_UPSTREAMS: &[&str] = &["official"];
 
 impl Config {
     pub fn from_env() -> Self {
@@ -282,6 +294,25 @@ impl Config {
                 }
             }
         }
+
+        // 7. cache_policy.upstream, when present, must name a known upstream
+        //    binding. `None` (default, cache behavior fully off) is always
+        //    valid and keeps the legacy eswitch routing. This is deliberately
+        //    NOT an effort fail-fast: Kimi effort enum validation is a Phase 3
+        //    startup behavior and must not be enabled in this phase.
+        for (name, provider) in &self.providers {
+            if let Some(policy) = &provider.cache_policy {
+                if let Some(upstream) = &policy.upstream {
+                    if !KNOWN_UPSTREAMS.contains(&upstream.as_str()) {
+                        panic!(
+                            "Provider '{}' cache_policy.upstream '{}' is not a \
+                             known upstream binding. Known upstreams: {:?}",
+                            name, upstream, KNOWN_UPSTREAMS
+                        );
+                    }
+                }
+            }
+        }
     }
 
     /// Load model config from file with priority:
@@ -419,6 +450,7 @@ impl Config {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
 
@@ -445,6 +477,7 @@ impl Config {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
 
@@ -469,6 +502,7 @@ impl Config {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
 
@@ -520,6 +554,7 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache::UsagePolicy;
 
     #[test]
     fn test_config_file_parse_with_providers_and_profiles() {
@@ -580,12 +615,21 @@ aliases = []
         assert_eq!(ds.reasoning_field, "reasoning_content");
         assert_eq!(ds.thinking_param.as_deref(), Some("thinking"));
         assert!(!ds.disable_thinking);
+        // Old config without a cache_policy block stays fully off (None).
+        assert!(
+            ds.cache_policy.is_none(),
+            "legacy provider without cache_policy must deserialize to None (cache off)"
+        );
 
         let fw = &providers["fireworks"];
         assert_eq!(fw.reasoning_field, "reasoning");
         assert_eq!(fw.reasoning_field_alt, Vec::<String>::new());
         assert!(fw.disable_thinking);
         assert!(fw.thinking_param.is_none());
+        assert!(
+            fw.cache_policy.is_none(),
+            "legacy provider without cache_policy must deserialize to None (cache off)"
+        );
 
         // Verify model_profiles are parsed
         let profiles = cf.model_profiles.expect("model_profiles should be Some");
@@ -617,6 +661,7 @@ aliases = []
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
 
@@ -758,5 +803,215 @@ reasoning_enabled = true
             config.wire_api_for_model("unlisted-model"),
             WireApi::ChatCompletions
         );
+    }
+
+    #[test]
+    fn cache_policy_parses_declared_and_defaults_off() {
+        // A provider that declares a cache_policy block parses it; a provider
+        // with an (empty) policy block stays off. No config.toml in this
+        // phase declares one — this is the opt-in path's parse contract.
+        let toml_str = r#"
+[providers.deepseek]
+reasoning_field = "reasoning_content"
+disable_thinking = false
+effort_param = "reasoning_effort"
+
+[providers.deepseek.effort_map]
+low = "high"
+high = "high"
+max = "max"
+
+[providers.deepseek.cache_policy]
+usage = "top_level_cached_tokens"
+
+[providers.glm]
+reasoning_field = "reasoning_content"
+disable_thinking = false
+effort_param = "reasoning_effort"
+
+[providers.glm.effort_map]
+high = "high"
+max = "max"
+
+[providers.glm.cache_policy]
+"#;
+
+        let cf: ConfigFile = toml::from_str(toml_str).expect("TOML should parse");
+        let providers = cf.providers.expect("providers should be Some");
+
+        let ds = &providers["deepseek"];
+        let policy = ds
+            .cache_policy
+            .as_ref()
+            .expect("declared cache_policy should deserialize");
+        assert_eq!(policy.usage, UsagePolicy::TopLevelCachedTokens);
+        assert_eq!(
+            policy.upstream, None,
+            "upstream defaults to None (eswitch routing)"
+        );
+        assert!(
+            policy.cache_usage_enabled(),
+            "naming a usage source opts into cache-usage telemetry"
+        );
+
+        // An empty policy block is still default-off.
+        let glm = &providers["glm"];
+        let policy = glm
+            .cache_policy
+            .as_ref()
+            .expect("empty cache_policy parses");
+        assert_eq!(policy.usage, UsagePolicy::Off);
+        assert_eq!(policy.upstream, None);
+        assert!(
+            !policy.cache_usage_enabled(),
+            "empty policy stays cache-off"
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "cache_policy.upstream")]
+    fn validate_rejects_unknown_cache_policy_upstream() {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "moonshot".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: true,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "low".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+                responses_reasoning_summary: None,
+                cache_policy: Some(CachePolicy {
+                    usage: UsagePolicy::TopLevelCachedTokens,
+                    upstream: Some("not-a-real-upstream".to_string()),
+                }),
+            },
+        );
+        let model_profiles = vec![ModelProfile {
+            name: "kimi-k3".to_string(),
+            provider: "moonshot".to_string(),
+            reasoning_enabled: true,
+            reasoning_replay: true,
+            toolcall_requires_reasoning: false,
+            aliases: vec![],
+            wire_api: WireApi::ChatCompletions,
+        }];
+
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: HashMap::new(),
+            default_model: "kimi-k3".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config.validate(); // should panic on unknown upstream binding
+    }
+
+    #[test]
+    fn validate_accepts_known_cache_policy_upstream_and_none() {
+        // upstream = None (the only state any built-in config uses) and the
+        // known "official" binding both validate cleanly.
+        let mut providers = HashMap::new();
+
+        // Provider with no cache_policy at all (legacy state).
+        providers.insert(
+            "deepseek".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning_content".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: Some("thinking".to_string()),
+                thinking_type_enabled: Some("enabled".to_string()),
+                thinking_type_disabled: Some("disabled".to_string()),
+                disable_thinking: false,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+                responses_reasoning_summary: None,
+                cache_policy: None,
+            },
+        );
+
+        // Provider with a policy whose upstream binds the official upstream.
+        providers.insert(
+            "moonshot".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: true,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "low".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+                responses_reasoning_summary: None,
+                cache_policy: Some(CachePolicy {
+                    usage: UsagePolicy::Off,
+                    upstream: Some("official".to_string()),
+                }),
+            },
+        );
+
+        let model_profiles = vec![
+            ModelProfile {
+                name: "deepseek-v4-pro".to_string(),
+                provider: "deepseek".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: true,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            },
+            ModelProfile {
+                name: "kimi-k3".to_string(),
+                provider: "moonshot".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            },
+        ];
+
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: HashMap::new(),
+            default_model: "deepseek-v4-pro".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config.validate(); // no panic expected
     }
 }

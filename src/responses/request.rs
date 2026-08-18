@@ -363,6 +363,7 @@ mod tests {
                 effort_param: "reasoning_effort".to_string(),
                 effort_map,
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
         let mut profile_by_name = HashMap::new();
