@@ -25,6 +25,15 @@ pub struct ChatCompletionRequest {
     pub tool_choice: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stop: Option<Vec<String>>,
+    /// Optional session cache key (Kimi `prompt_cache_key`).
+    ///
+    /// Phase 2b.2 scope: field + serde contract only — the value is always
+    /// `None` (the only literal in the repo sets it to `None`), so the field
+    /// is omitted from the wire and every per-wire golden stays byte-identical.
+    /// Phase 3 wires `cache::session_key_from_source` here; the Responses
+    /// encoder is an explicit non-goal and never carries this field.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt_cache_key: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -361,6 +370,54 @@ mod tests {
         assert_eq!(usage.prompt_cache_hit_tokens, Some(60));
         assert_eq!(usage.prompt_cache_miss_tokens, Some(40));
         assert_eq!(usage.cached_tokens, None);
+    }
+
+    // --- Phase 2b.2: Chat `prompt_cache_key` serde contract (T16) ---
+
+    fn chat_request(prompt_cache_key: Option<String>) -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "kimi-k3-turbo".to_string(),
+            messages: vec![serde_json::json!({"role": "user", "content": "hi"})],
+            max_tokens: None,
+            max_completion_tokens: None,
+            stream: None,
+            stream_options: None,
+            temperature: None,
+            top_p: None,
+            reasoning_effort: None,
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            stop: None,
+            prompt_cache_key,
+        }
+    }
+
+    #[test]
+    fn chat_request_none_prompt_cache_key_is_omitted_from_wire() {
+        // T16 (MUST, serde): with `prompt_cache_key: None` the field must not
+        // appear on the serialized wire at all (fail-closed; nothing injected).
+        let value = serde_json::to_value(chat_request(None)).unwrap();
+        assert!(
+            !value.as_object().unwrap().contains_key("prompt_cache_key"),
+            "None must omit the field from the wire"
+        );
+        // A missing field on the wire round-trips back to None.
+        let back: ChatCompletionRequest = serde_json::from_value(value).unwrap();
+        assert_eq!(back.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn chat_request_some_prompt_cache_key_serializes_field() {
+        // Isolated unit contract: when a later phase (Phase 3) injects a key,
+        // the field serializes as a plain string. Not wired into any
+        // production path — the only repo literal sets it to None.
+        let key = "0123456789abcdef0123456789abcdef".to_string();
+        let value = serde_json::to_value(chat_request(Some(key.clone()))).unwrap();
+        assert_eq!(
+            value.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some(key.as_str())
+        );
     }
 }
 

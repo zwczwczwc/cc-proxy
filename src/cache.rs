@@ -28,6 +28,7 @@
 use crate::openai::types::Usage as ChatUsage;
 use crate::responses::types::ResponsesUsage;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Which upstream usage shape produced a `CacheStats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -116,6 +117,69 @@ impl CachePolicy {
     pub fn cache_usage_enabled(&self) -> bool {
         !matches!(self.usage, UsagePolicy::Off)
     }
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic, fail-closed session cache key (Phase 2b.2).
+//
+// Phase 2b.2 scope: pure helper + contract tests only. Nothing injects the
+// key into outbound requests yet — Chat encoder injection is Phase 3
+// behavior, and the Responses encoder is an explicit non-goal that never
+// carries `prompt_cache_key` (Kimi rides the Chat wire).
+// ---------------------------------------------------------------------------
+
+/// Derive a deterministic, fail-closed session cache key.
+///
+/// Contract (KIMI-K3-CACHE-OPTIMIZATION-FINAL-PLAN §3.3, report 45/46):
+///
+/// ```text
+/// session_key := sha256( upstream_provider | model | source_name | source_value )[..16]
+/// ```
+///
+/// where `upstream_provider` combines `provider` with the optional policy
+/// `upstream` binding (`"provider:upstream"` when bound, `"provider"` when
+/// unbound), and this entry point names the `metadata.user_id` source.
+///
+/// - **Fail-closed**: no stable source ⇒ `None`. The key is NEVER derived
+///   from a UUID / random / clock — a per-request nonce would guarantee a
+///   cache miss, so the plan forbids it outright.
+/// - **Deterministic & stateless**: identical inputs yield an identical key
+///   across calls and across process restarts (pure function of inbound
+///   signal; no shared state).
+/// - **No plaintext**: the returned value is a hex digest of the first 16
+///   bytes of the hash; user/token-like source text never appears in it, and
+///   this function performs no I/O and writes no logs — only the outbound key
+///   is returned.
+///
+/// Future inbound sources (e.g. a session-id header set by an ingress) should
+/// extend this module with their own source label so keys stay namespaced by
+/// source channel.
+#[cfg_attr(
+    not(test),
+    expect(
+        dead_code,
+        reason = "fail-closed session key; wired in Phase 3 injection"
+    )
+)]
+pub(crate) fn session_key_from_source(
+    source: Option<&str>,
+    provider: &str,
+    model: &str,
+    upstream: Option<&str>,
+) -> Option<String> {
+    let source_value = source?;
+    let upstream_provider = match upstream {
+        Some(binding) => format!("{provider}:{binding}"),
+        None => provider.to_string(),
+    };
+    // Canonical framing of the plan's `upstream_provider | model |
+    // source_name | source_value`. `source_name` is fixed to the metadata
+    // source for this entry point.
+    let canonical = format!("{upstream_provider}|{model}|metadata.user_id|{source_value}");
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let digest = hasher.finalize();
+    Some(hex::encode(&digest[..16]))
 }
 
 /// Map an OpenAI-compatible chat completions `Usage` into `CacheStats`.
@@ -533,5 +597,130 @@ mod tests {
             json,
             r#"{"usage":"top_level_cached_tokens","upstream":"official"}"#
         );
+    }
+
+    // --- Phase 2b.2: fail-closed session cache key contract (T16-T19) ---
+
+    #[test]
+    fn no_stable_source_returns_none_fail_closed() {
+        // T16 (MUST): no session context => no key (fail-closed). A None
+        // source must never be replaced by a random / UUID / time fallback.
+        assert_eq!(
+            session_key_from_source(None, "moonshot-official", "kimi-k3-turbo", None),
+            None
+        );
+        assert_eq!(
+            session_key_from_source(None, "moonshot-official", "kimi-k3-turbo", Some("official")),
+            None
+        );
+    }
+
+    #[test]
+    fn same_session_derives_byte_equal_key_across_calls() {
+        // T17 (MUST): the same session identity over multiple turns yields a
+        // byte-equal key on every call.
+        let first =
+            session_key_from_source(Some("user_123"), "moonshot-official", "kimi-k3-turbo", None);
+        let second =
+            session_key_from_source(Some("user_123"), "moonshot-official", "kimi-k3-turbo", None);
+        assert_eq!(first, second);
+        assert!(first.is_some());
+    }
+
+    #[test]
+    fn reconnect_and_restart_preserve_key_deterministically() {
+        // T18 (MUST): reconnect / process restart must not change the key.
+        // The derivation is a stateless deterministic hash of inbound signal
+        // (no UUID / random / clock), so re-deriving it must yield the same
+        // bytes. Exercise it across many repeated calls to mirror restarting.
+        let key =
+            session_key_from_source(Some("user_456"), "moonshot-official", "kimi-k3-turbo", None)
+                .expect("stable source present");
+        for _ in 0..100 {
+            assert_eq!(
+                session_key_from_source(
+                    Some("user_456"),
+                    "moonshot-official",
+                    "kimi-k3-turbo",
+                    None
+                )
+                .as_deref(),
+                Some(key.as_str())
+            );
+        }
+    }
+
+    #[test]
+    fn different_session_yields_different_key() {
+        // T19 (MUST, part 1): a different session identity => a different key.
+        let a = session_key_from_source(
+            Some("session-A"),
+            "moonshot-official",
+            "kimi-k3-turbo",
+            None,
+        );
+        let b = session_key_from_source(
+            Some("session-B"),
+            "moonshot-official",
+            "kimi-k3-turbo",
+            None,
+        );
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn session_key_is_hashed_hex_and_hides_plaintext() {
+        // T19 (MUST, part 2): user/token-like source text is hashed — the
+        // outbound key never contains the plaintext and has a fixed
+        // length/format (first 16 bytes of sha256 => 32 lowercase hex chars).
+        let secret = "sk-ant-0123456789abcdef_secret-user-token";
+        let key = session_key_from_source(
+            Some(secret),
+            "moonshot-official",
+            "kimi-k3-turbo",
+            Some("official"),
+        )
+        .expect("stable source present");
+        assert!(
+            !key.contains(secret),
+            "plaintext must never leak into the key"
+        );
+        assert_eq!(key.len(), 32, "16 hash bytes => 32 hex chars");
+        assert!(
+            key.chars().all(|c| c.is_ascii_hexdigit()),
+            "key must be hex"
+        );
+        assert_eq!(key, key.to_lowercase(), "hex digest is lowercase");
+        // Deterministic across repeated calls (T18).
+        assert_eq!(
+            session_key_from_source(
+                Some(secret),
+                "moonshot-official",
+                "kimi-k3-turbo",
+                Some("official")
+            )
+            .as_deref(),
+            Some(key.as_str())
+        );
+    }
+
+    #[test]
+    fn key_is_namespaced_by_provider_model_and_upstream() {
+        // The plan pins the key to (user_id/session, model, provider); changing
+        // any of those inputs must change the key, and an upstream binding
+        // must namespace the key too.
+        let base = session_key_from_source(Some("u_1"), "moonshot-official", "kimi-k3-turbo", None);
+        let other_provider = session_key_from_source(Some("u_1"), "eswitch", "kimi-k3-turbo", None);
+        let other_model =
+            session_key_from_source(Some("u_1"), "moonshot-official", "kimi-k3-turbo-next", None);
+        let bound = session_key_from_source(
+            Some("u_1"),
+            "moonshot-official",
+            "kimi-k3-turbo",
+            Some("official"),
+        );
+        assert_ne!(base, other_provider, "provider change must change key");
+        assert_ne!(base, other_model, "model change must change key");
+        assert_ne!(base, bound, "upstream binding must namespace the key");
     }
 }

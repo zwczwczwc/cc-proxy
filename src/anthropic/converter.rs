@@ -125,6 +125,9 @@ pub(crate) fn convert_request_with_relocation(
         tools: None,
         tool_choice: None,
         stop: None,
+        // Phase 2b.2: field only, always None (default). Injection of a
+        // derived session key is Phase 3 behavior — never set here.
+        prompt_cache_key: None,
     };
 
     // Convert tools (sorted by name for KV cache prefix stability)
