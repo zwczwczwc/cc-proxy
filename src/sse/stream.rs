@@ -51,6 +51,7 @@ pub fn process_stream(
     reasoning_field: String,
     reasoning_field_alt: Vec<String>,
     msg_id: String,
+    cache_policy: Option<crate::cache::CachePolicy>,
     body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel::<Event>(256);
@@ -64,8 +65,12 @@ pub fn process_stream(
     );
 
     tokio::spawn(async move {
-        let mut state_machine =
-            SseStateMachine::new(is_reasoning_model, reasoning_field, reasoning_field_alt);
+        let mut state_machine = SseStateMachine::new(
+            is_reasoning_model,
+            reasoning_field,
+            reasoning_field_alt,
+            cache_policy.clone(),
+        );
 
         // Send message_start first (audit defect 3.1)
         let msg_start = state_machine.message_start(&model, &msg_id);
@@ -337,25 +342,19 @@ pub fn process_stream(
             }
         }
 
-        // Log KV cache statistics if available
+        // Log KV cache statistics if available. A single policy-gated view
+        // computes the buckets: Legacy (default — policy None/off) reproduces
+        // the historical numbers exactly (hit = ptd.cached_tokens, clamped
+        // miss, formatted hit rate); Raw (explicit usage source) reads the
+        // canonical read (top-level → nested → DeepSeek hit) with a guarded
+        // miss. Field names and formatting are unchanged.
         if let Some(ref u) = last_usage {
-            let hit = u
-                .prompt_tokens_details
-                .as_ref()
-                .and_then(|d| d.cached_tokens)
-                .unwrap_or(0);
-            let prompt_total = u.prompt_tokens.unwrap_or(0);
-            let miss = prompt_total.saturating_sub(hit);
-            let rate = if prompt_total > 0 {
-                (hit as f64 / prompt_total as f64) * 100.0
-            } else {
-                0.0
-            };
+            let view = crate::cache::chat_usage_view(Some(u), cache_policy.as_ref());
             tracing::info!(
-                cache_hit = hit,
-                cache_miss = miss,
-                prompt_tokens = prompt_total,
-                hit_rate = format!("{:.1}%", rate),
+                cache_hit = view.read.unwrap_or(0),
+                cache_miss = view.miss.unwrap_or(0),
+                prompt_tokens = view.input.unwrap_or(0),
+                hit_rate = format!("{:.1}%", view.hit_rate.unwrap_or(0.0)),
                 "KV cache stats"
             );
         }

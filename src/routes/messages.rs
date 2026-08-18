@@ -179,12 +179,14 @@ async fn handle_messages(
         let upstream_model = &openai_req.model;
         let is_reasoning_model = requires_reasoning_content(upstream_model, &config);
         let (reasoning_field, reasoning_field_alt) = get_reasoning_fields(upstream_model, &config);
+        let cache_policy = cache_policy_for(&config, upstream_model);
         let sse_response = process_stream(
             model,
             is_reasoning_model,
             reasoning_field,
             reasoning_field_alt,
             msg_id,
+            cache_policy,
             byte_stream,
         );
         sse_response.into_response()
@@ -228,12 +230,14 @@ async fn handle_messages(
                 let upstream_model = &openai_req.model;
                 let (reasoning_field, reasoning_field_alt) =
                     get_reasoning_fields(upstream_model, &config);
+                let cache_policy = cache_policy_for(&config, upstream_model);
                 let anthropic_resp = convert_non_stream_response(
                     &parsed,
                     &model,
                     &msg_id,
                     &reasoning_field,
                     &reasoning_field_alt,
+                    cache_policy.as_ref(),
                 );
                 (StatusCode::OK, Json(anthropic_resp)).into_response()
             }

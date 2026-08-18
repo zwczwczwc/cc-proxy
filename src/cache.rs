@@ -12,8 +12,10 @@
 //   * `CacheStatsMode::Raw` (explicit `cache_policy.usage`): the canonical
 //     `CacheStats` projection (`from_responses_usage`) with a guarded miss and
 //     a raw hit rate.
-// The Chat adapters (`from_chat_usage` / `from_optional_*`) remain unwired;
-// Phase 2b.4 threads them behind the same gate.
+// As of Phase 2b.4 the Chat path (`openai/converter.rs`, `sse/stream.rs`)
+// reads its cache-usage view through `chat_usage_view` /
+// `chat_usage_view_from_buckets`, behind the same policy gate — `from_chat_usage`
+// now has production callers; the `from_optional_*` wrappers remain test-only.
 //
 // Semantics:
 // - `input_tokens`          : prompt / input tokens as reported upstream.
@@ -179,10 +181,8 @@ pub(crate) fn session_key_from_source(
 /// Handles Kimi top-level `cached_tokens` (GAP-A, optional), Kimi/OpenAI nested
 /// `prompt_tokens_details.cached_tokens`, and DeepSeek `prompt_cache_hit_tokens`
 /// / `prompt_cache_miss_tokens`. Read priority: top-level → nested → hit.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "usage adapter; wired in a later phase")
-)]
+/// Production callers: `chat_usage_view` (raw branch) and the SSE stream
+/// terminal handler's raw-read capture.
 pub(crate) fn from_chat_usage(usage: &ChatUsage) -> CacheStats {
     let input = usage.prompt_tokens;
     let read = usage
@@ -412,6 +412,134 @@ fn raw_hit_rate(input: Option<u32>, read: Option<u32>) -> Option<f64> {
     match (input, read) {
         (Some(input), Some(read)) if input > 0 => Some(read as f64 / input as f64 * 100.0),
         _ => None,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Chat usage view selector (Phase 2b.4).
+//
+// Mirrors `responses_usage_view` (Phase 2b.3) for the Chat wire. Exactly ONE
+// mode is computed per request — `Legacy` or `Raw` — decided by the same
+// `CacheStatsMode::from_policy` gate:
+//   * `Legacy` (default — policy `None`/off): reproduces the pre-existing Chat
+//     arithmetic byte-for-byte — read ONLY from `prompt_tokens_details.cached_
+//     tokens`, creation labeled as `prompt - cached` (the historical remainder
+//     label), clamped miss and `0.0` hit rate on zero input.
+//   * `Raw` (explicit `cache_policy.usage`): the canonical `CacheStats`
+//     projection (`from_chat_usage`) — read priority top-level `cached_tokens`
+//     → nested `prompt_tokens_details.cached_tokens` → DeepSeek hit; creation
+//     ALWAYS `None` for Chat (the `prompt - cached` remainder is miss, never a
+//     write); guarded miss (unknown on inconsistent input, never negative).
+// The view is the single source for the wire `read`/`creation` fields and the
+// KV-cache log buckets, so wire and log can never disagree and a request never
+// reports cache usage twice.
+// ---------------------------------------------------------------------------
+
+/// Normalized Chat cache-usage view (input / read / creation / miss / hit rate).
+///
+/// `read`/`creation` feed the Anthropic wire; `miss`/`hit_rate` feed the
+/// KV-cache log. Absent usage ⇒ an empty view (never a fabricated miss — an
+/// HTTP error or a missing usage object is not a miss).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ChatUsageView {
+    pub(crate) input: Option<u32>,
+    pub(crate) read: Option<u32>,
+    pub(crate) creation: Option<u32>,
+    pub(crate) miss: Option<u32>,
+    pub(crate) hit_rate: Option<f64>,
+}
+
+impl ChatUsageView {
+    fn empty() -> Self {
+        ChatUsageView {
+            input: None,
+            read: None,
+            creation: None,
+            miss: None,
+            hit_rate: None,
+        }
+    }
+}
+
+/// Non-stream selector: map a typed `ChatUsage` (plus policy) into the view.
+/// `None` usage (HTTP error / timeout / missing usage) yields an empty view —
+/// never a miss bucket.
+pub(crate) fn chat_usage_view(
+    usage: Option<&ChatUsage>,
+    policy: Option<&CachePolicy>,
+) -> ChatUsageView {
+    let Some(usage) = usage else {
+        return ChatUsageView::empty();
+    };
+    match CacheStatsMode::from_policy(policy) {
+        CacheStatsMode::Raw => {
+            // Canonical raw projection (the `CacheStats` adapter), plus a raw
+            // hit rate. Creation stays `None`: Chat completions never report a
+            // write, and the `prompt - cached` remainder is miss, not creation.
+            let stats = from_chat_usage(usage);
+            ChatUsageView {
+                input: stats.input_tokens,
+                read: stats.cache_read_tokens,
+                creation: None,
+                miss: stats.cache_miss_tokens,
+                hit_rate: raw_hit_rate(stats.input_tokens, stats.cache_read_tokens),
+            }
+        }
+        CacheStatsMode::Legacy => {
+            // Legacy read is ptd-only (top-level cached_tokens and DeepSeek
+            // hit/miss are invisible to non-opt-in providers); legacy creation
+            // is the historical `prompt - cached` remainder label.
+            let read = usage
+                .prompt_tokens_details
+                .as_ref()
+                .and_then(|details| details.cached_tokens);
+            chat_usage_view_from_buckets(usage.prompt_tokens, read, None, None)
+        }
+    }
+}
+
+/// Stream selector: build the view from the buckets already merged by the SSE
+/// terminal handler.
+///
+/// `read` is the legacy read (nested `prompt_tokens_details.cached_tokens`,
+/// byte-preserving for non-opt-in providers); `raw_read` is the canonical read
+/// (top-level → nested → DeepSeek hit) used only under opt-in. `None`/off
+/// policy ignores `raw_read` and reproduces the historical wire/log exactly.
+pub(crate) fn chat_usage_view_from_buckets(
+    input: Option<u32>,
+    read: Option<u32>,
+    raw_read: Option<u32>,
+    policy: Option<&CachePolicy>,
+) -> ChatUsageView {
+    match CacheStatsMode::from_policy(policy) {
+        CacheStatsMode::Raw => ChatUsageView {
+            input,
+            read: raw_read,
+            creation: None,
+            miss: derive_miss(input, raw_read, None),
+            hit_rate: raw_hit_rate(input, raw_read),
+        },
+        CacheStatsMode::Legacy => {
+            let creation = match (input, read) {
+                (Some(p), Some(c)) if p > c => Some(p - c),
+                _ => None,
+            };
+            let miss = input.map(|input| input.saturating_sub(read.unwrap_or(0)));
+            let hit_rate = input.map(|input| {
+                if input == 0 {
+                    0.0
+                } else {
+                    read.unwrap_or(0) as f64 / input as f64 * 100.0
+                }
+            });
+            ChatUsageView {
+                input,
+                read,
+                creation,
+                miss,
+                hit_rate,
+            }
+        }
     }
 }
 
@@ -1047,5 +1175,202 @@ mod tests {
         let legacy_usage = responses_usage_view(Some(&usage), None);
         let legacy_buckets = responses_usage_view_from_buckets(Some(100), Some(70), Some(5), None);
         assert_eq!(legacy_usage, legacy_buckets);
+    }
+
+    // --- Phase 2b.4: Chat usage view selector (legacy vs raw) ---
+
+    #[test]
+    fn chat_usage_view_default_off_matches_legacy_wire_baseline() {
+        // Nested ptd under no policy: legacy read = ptd.cached_tokens only,
+        // creation = prompt - cached (the historical remainder label), clamped
+        // miss, percentage hit rate.
+        let usage = chat_usage(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 70},
+        }));
+        let view = chat_usage_view(Some(&usage), None);
+        assert_eq!(view.input, Some(100));
+        assert_eq!(view.read, Some(70), "legacy read = ptd.cached_tokens only");
+        assert_eq!(
+            view.creation,
+            Some(30),
+            "legacy creation = prompt - cached (historical remainder label)"
+        );
+        assert_eq!(view.miss, Some(30), "legacy miss = input - read");
+        assert_eq!(view.hit_rate, Some(70.0));
+
+        // An explicitly off policy must behave byte-identically to None.
+        let off = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+        };
+        assert_eq!(chat_usage_view(Some(&usage), Some(&off)), view);
+    }
+
+    #[test]
+    fn chat_usage_view_raw_under_opt_in_reads_top_level_first() {
+        // Kimi top-level cached_tokens wins over nested; creation is NEVER
+        // fabricated from `prompt - cached`.
+        let usage = chat_usage(json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cached_tokens": 70,
+            "prompt_tokens_details": {"cached_tokens": 60},
+        }));
+        let view = chat_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(view.read, Some(70), "raw read priority: top-level → nested");
+        assert_eq!(
+            view.creation, None,
+            "Chat never fabricates a write/creation"
+        );
+        assert_eq!(view.miss, Some(30));
+        assert_eq!(view.hit_rate, Some(70.0));
+        // The raw projection must be exactly `from_chat_usage`.
+        let stats = from_chat_usage(&usage);
+        assert_eq!(view.read, stats.cache_read_tokens);
+        assert_eq!(view.miss, stats.cache_miss_tokens);
+    }
+
+    #[test]
+    fn chat_usage_view_raw_deepseek_hit_and_miss_are_preserved() {
+        let usage = chat_usage(json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_miss_tokens": 40,
+        }));
+        let view = chat_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(view.read, Some(60));
+        assert_eq!(view.creation, None);
+        assert_eq!(
+            view.miss,
+            Some(40),
+            "explicit miss preserved, not re-derived"
+        );
+    }
+
+    #[test]
+    fn chat_usage_view_legacy_ignores_top_level_and_deepseek() {
+        // Legacy wire/log reads ONLY ptd.cached_tokens: top-level cached_tokens
+        // and DeepSeek hit/miss are invisible to non-opt-in providers.
+        let top = chat_usage(json!({
+            "prompt_tokens": 100,
+            "cached_tokens": 70,
+        }));
+        let legacy_top = chat_usage_view(Some(&top), None);
+        assert_eq!(
+            legacy_top.read, None,
+            "legacy ignores top-level cached_tokens"
+        );
+        assert_eq!(legacy_top.creation, None);
+        assert_eq!(
+            legacy_top.miss,
+            Some(100),
+            "legacy clamps miss to input when read is unknown"
+        );
+
+        let ds = chat_usage(json!({
+            "prompt_tokens": 100,
+            "prompt_cache_hit_tokens": 60,
+        }));
+        assert_eq!(
+            chat_usage_view(Some(&ds), None).read,
+            None,
+            "legacy ignores DeepSeek hit"
+        );
+    }
+
+    #[test]
+    fn chat_usage_view_raw_cached_greater_than_prompt_yields_unknown_miss() {
+        let usage = chat_usage(json!({
+            "prompt_tokens": 50,
+            "cached_tokens": 70,
+        }));
+        let raw = chat_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(raw.read, Some(70));
+        assert_eq!(
+            raw.miss, None,
+            "raw never fabricates a negative/clamped miss"
+        );
+        // Legacy ignores top-level: read unknown ⇒ miss clamps to input.
+        let legacy = chat_usage_view(Some(&usage), None);
+        assert_eq!(legacy.read, None);
+        assert_eq!(legacy.miss, Some(50));
+    }
+
+    #[test]
+    fn chat_usage_view_none_usage_is_empty_never_a_miss() {
+        // HTTP error / timeout / missing usage object ⇒ empty view in BOTH
+        // modes; never a fabricated miss or zero.
+        let legacy = chat_usage_view(None, None);
+        let raw = chat_usage_view(None, Some(&raw_policy()));
+        let empty = ChatUsageView {
+            input: None,
+            read: None,
+            creation: None,
+            miss: None,
+            hit_rate: None,
+        };
+        assert_eq!(legacy, empty);
+        assert_eq!(raw, empty);
+    }
+
+    #[test]
+    fn chat_usage_view_zero_input_hit_rate_differs_legacy_vs_raw() {
+        let usage = chat_usage(json!({
+            "prompt_tokens": 0,
+            "cached_tokens": 0,
+        }));
+        let legacy = chat_usage_view(Some(&usage), None);
+        assert_eq!(
+            legacy.hit_rate,
+            Some(0.0),
+            "legacy clamps zero input to 0.0"
+        );
+        assert_eq!(legacy.read, None, "legacy ignores top-level even at zero");
+        assert_eq!(legacy.miss, Some(0));
+        let raw = chat_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(
+            raw.hit_rate, None,
+            "raw hit rate unknown when input is zero"
+        );
+        assert_eq!(raw.read, Some(0));
+        assert_eq!(raw.miss, Some(0), "input=0, read=0 ⇒ miss 0 (consistent)");
+    }
+
+    #[test]
+    fn chat_usage_view_from_buckets_matches_non_stream_selector() {
+        // Stream path uses the same selector over already-extracted buckets, so
+        // streamed and non-streamed chats report identically for a policy.
+        let usage = chat_usage(json!({
+            "prompt_tokens": 100,
+            "cached_tokens": 70,
+            "prompt_tokens_details": {"cached_tokens": 60},
+        }));
+        let raw_via_usage = chat_usage_view(Some(&usage), Some(&raw_policy()));
+        let raw_via_buckets =
+            chat_usage_view_from_buckets(Some(100), Some(60), Some(70), Some(&raw_policy()));
+        assert_eq!(raw_via_usage, raw_via_buckets);
+
+        let legacy_usage = chat_usage_view(Some(&usage), None);
+        let legacy_buckets = chat_usage_view_from_buckets(Some(100), Some(60), None, None);
+        assert_eq!(legacy_usage, legacy_buckets);
+    }
+
+    #[test]
+    fn chat_usage_view_creation_never_fabricated_under_raw_across_shapes() {
+        // Every Chat shape under opt-in reports creation None — the historical
+        // `prompt - cached` remainder is miss, never a write.
+        for value in [
+            json!({"prompt_tokens": 100, "cached_tokens": 70}),
+            json!({"prompt_tokens": 100, "prompt_tokens_details": {"cached_tokens": 70}}),
+            json!({"prompt_tokens": 100, "prompt_cache_hit_tokens": 60}),
+        ] {
+            let usage = chat_usage(value);
+            let view = chat_usage_view(Some(&usage), Some(&raw_policy()));
+            assert_eq!(view.creation, None);
+        }
     }
 }
