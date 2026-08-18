@@ -1347,4 +1347,80 @@ mod tests {
         });
         assert!(terminal_usage(&completed_without_usage).is_none());
     }
+
+    // ============ B10 guard (Responses wire) ============
+    // The first Responses stream event must carry a non-null usage object.
+    // Claude Code's Agent tool dereferences
+    // `message_start.message.usage.input_tokens` and crashes on null.
+
+    /// Parse an SSE payload into `(event, data)` pairs.
+    fn parse_sse(text: &str) -> Vec<(String, serde_json::Value)> {
+        let mut frames = Vec::new();
+        for block in text.split("\n\n") {
+            let block = block.trim();
+            if block.is_empty() {
+                continue;
+            }
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event: ") {
+                    event = v.to_string();
+                } else if let Some(v) = line.strip_prefix("data: ") {
+                    data.push_str(v);
+                }
+            }
+            if !data.is_empty() {
+                let json: serde_json::Value = serde_json::from_str(&data)
+                    .unwrap_or_else(|e| panic!("bad SSE data frame: {e}: {data}"));
+                frames.push((event, json));
+            }
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn responses_message_start_usage_is_non_null_object() {
+        use axum::response::IntoResponse;
+        let body = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"r1\",\"model\":\"kimi-k3-turbo\"}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"r1\",\"status\":\"completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":5}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let bytes = bytes::Bytes::from(body.to_string());
+        let stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
+        let sse = process_stream(
+            "kimi-k3-turbo".to_string(),
+            "msg_test".to_string(),
+            "req_b10".to_string(),
+            stream,
+            None,
+        );
+        let response = sse.into_response();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("read response body");
+        let frames = parse_sse(&String::from_utf8_lossy(&body_bytes));
+        let (event, value) = frames
+            .iter()
+            .find(|(e, _)| e == "message_start")
+            .expect("message_start present");
+        assert_eq!(event, "message_start");
+        let usage = &value["message"]["usage"];
+        assert!(
+            usage.is_object(),
+            "message_start.message.usage must be an object: {value}"
+        );
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            assert!(
+                usage.get(field).is_some_and(serde_json::Value::is_number),
+                "message_start.usage.{field} must be a non-null number, got: {usage}"
+            );
+        }
+    }
 }

@@ -438,11 +438,19 @@ impl SseStateMachine {
                 role: "assistant".to_string(),
                 content: vec![],
                 model: model.to_string(),
+                // Usage must be an object with non-null numeric fields, not
+                // null: Claude Code's Agent tool dereferences
+                // message_start.message.usage.input_tokens and crashes on null
+                // ("null is not an object (evaluating 'o.input_tokens')").
+                // Zero placeholders are allowed here — real input/output/cache
+                // usage is only known from the upstream terminal chunk and is
+                // reported on the terminal message_delta; these zeros are never
+                // a fabricated cache read/write.
                 usage: Some(StreamUsage {
-                    input_tokens: None,
-                    output_tokens: None,
-                    cache_read_input_tokens: None,
-                    cache_creation_input_tokens: None,
+                    input_tokens: Some(0),
+                    output_tokens: Some(0),
+                    cache_read_input_tokens: Some(0),
+                    cache_creation_input_tokens: Some(0),
                 }),
             },
         }
@@ -908,6 +916,64 @@ mod tests {
                 }
             ),
             "tool delta must produce a tool_use block, not text: {events:?}"
+        );
+    }
+
+    // ============ B10: Chat message_start usage must be a non-null object ============
+    // Claude Code's Agent tool dereferences `message_start.message.usage.input_tokens`
+    // and crashes when it is null ("null is not an object (evaluating
+    // 'o.input_tokens')"). The first event of the Chat stream must carry a usage
+    // OBJECT whose numeric fields are non-null numbers. Zero placeholders are
+    // permitted here — real input/output/cache usage is only known from the
+    // upstream terminal chunk and belongs on the terminal message_delta.
+
+    #[test]
+    fn chat_stream_message_start_usage_is_non_null_object() {
+        let mut sm = SseStateMachine::new(false, "reasoning_content".into(), vec![], None);
+        let event = sm.message_start("kimi-k3-turbo", "msg_b10");
+        let value = serde_json::to_value(&event).expect("message_start serializes");
+        let usage = &value["message"]["usage"];
+        assert!(
+            usage.is_object(),
+            "message_start.message.usage must be an object, got: {value}"
+        );
+        for field in [
+            "input_tokens",
+            "output_tokens",
+            "cache_read_input_tokens",
+            "cache_creation_input_tokens",
+        ] {
+            assert!(
+                usage.get(field).is_some_and(serde_json::Value::is_number),
+                "message_start.usage.{field} must be a non-null number, got: {usage}"
+            );
+        }
+    }
+
+    #[test]
+    fn chat_stream_message_start_placeholder_never_overrides_terminal_usage() {
+        // B10 guard: the zero placeholders on message_start are never real
+        // cache read/write. The terminal message_delta still carries the real
+        // upstream buckets, and message_start never pretends to be them.
+        let mut sm = SseStateMachine::new(false, "reasoning_content".into(), vec![], None);
+        let start = sm.message_start("kimi-k3-turbo", "msg_b10");
+        let u = usage(serde_json::json!({
+            "prompt_tokens": 100, "completion_tokens": 20, "total_tokens": 120,
+            "prompt_tokens_details": {"cached_tokens": 70},
+        }));
+        let _ = sm.process_delta(&usage_only_delta(), Some(&u));
+        let final_events = sm.finalize(Some("stop"), Some(20), Some(&u));
+        let md = message_delta_usage(&final_events);
+        assert_eq!(md.input_tokens, Some(100));
+        assert_eq!(md.output_tokens, Some(20));
+        assert_eq!(md.cache_read_input_tokens, Some(70));
+        assert_eq!(md.cache_creation_input_tokens, Some(30));
+        // The message_start placeholder is not the terminal usage.
+        let start_value = serde_json::to_value(&start).expect("message_start serializes");
+        let su = &start_value["message"]["usage"];
+        assert_ne!(
+            su["input_tokens"], 100,
+            "message_start must not carry terminal usage: {start_value}"
         );
     }
 }
