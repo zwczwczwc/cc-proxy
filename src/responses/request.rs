@@ -15,7 +15,7 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     )
 }
 
-fn convert_request_with_relocation(
+pub(crate) fn convert_request_with_relocation(
     req: &MessagesRequest,
     config: &Config,
     relocate: bool,

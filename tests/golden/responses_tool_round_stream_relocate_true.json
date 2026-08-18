@@ -1,0 +1,34 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "call lookup",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "arguments": "{\"q\":\"Paris\"}",
+        "call_id": "call-1",
+        "name": "lookup",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call-1",
+        "output": "ok",
+        "type": "function_call_output"
+      }
+    ],
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": true
+  },
+  "fixture": "tool_round_stream",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "6778e5b76c0aafa1dbb1ee97f828493aa1ff8203865605c80a4a03895f79ea35",
+  "wire": "responses"
+}

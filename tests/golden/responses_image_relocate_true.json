@@ -1,0 +1,23 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "image_url": "data:image/png;base64,aGVsbG8=",
+            "type": "input_image"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "image",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "f3b2f42fe57188ede706eba4502cfccae14d32b8f8aa75c80aafd13676edfc19",
+  "wire": "responses"
+}

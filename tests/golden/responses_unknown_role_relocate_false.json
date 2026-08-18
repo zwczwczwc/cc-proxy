@@ -1,0 +1,32 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "set temperature to 0",
+            "type": "input_text"
+          }
+        ],
+        "role": "developer"
+      },
+      {
+        "content": [
+          {
+            "text": "hello",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "unknown_role",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "f123887dd26cf7514d4b928269aa4ebf5c44efb970a1246ab17327698fa56758",
+  "wire": "responses"
+}

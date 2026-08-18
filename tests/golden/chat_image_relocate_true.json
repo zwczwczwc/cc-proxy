@@ -1,0 +1,27 @@
+{
+  "body": {
+    "max_completion_tokens": 4096,
+    "max_tokens": null,
+    "messages": [
+      {
+        "content": [
+          {
+            "image_url": {
+              "url": "data:image/png;base64,aGVsbG8="
+            },
+            "type": "image_url"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": false
+  },
+  "fixture": "image",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "4ace2e04bfc7bc43fda043ec51f4aa7d84fbd96a418b409b8e68575f07b3b510",
+  "wire": "chat"
+}

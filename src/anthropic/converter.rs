@@ -35,6 +35,20 @@ pub fn convert_request(
     req: &MessagesRequest,
     config: &Config,
 ) -> anyhow::Result<ChatCompletionRequest> {
+    let relocate = std::env::var("CODEMERMAFROST_RELOCATE").is_ok();
+    convert_request_with_relocation(req, config, relocate)
+}
+
+/// Same as [`convert_request`] with an explicit relocate decision.
+///
+/// Zero behavior change: [`convert_request`] passes the process-level
+/// `CODEMERMAFROST_RELOCATE` flag here. Tests use this variant to capture and
+/// verify both relocate states deterministically (no process-global env races).
+pub(crate) fn convert_request_with_relocation(
+    req: &MessagesRequest,
+    config: &Config,
+    relocate: bool,
+) -> anyhow::Result<ChatCompletionRequest> {
     let model = req.model.clone();
     // Map Claude model names to upstream model names for eswitch
     let upstream_model = map_model_to_upstream(&model, config);
@@ -63,7 +77,7 @@ pub fn convert_request(
     // Feature flag: relocate volatile env blocks from system prefix to last user turn
     // to stabilise KV cache prefix across turns.
     // Controlled by env var CODEMERMAFROST_RELOCATE.
-    let (system, messages_ref) = if std::env::var("CODEMERMAFROST_RELOCATE").is_ok() {
+    let (system, messages_ref) = if relocate {
         let raw_system = req
             .system
             .clone()

@@ -1,0 +1,43 @@
+{
+  "body": {
+    "max_completion_tokens": 4096,
+    "max_tokens": null,
+    "messages": [
+      {
+        "content": "call lookup",
+        "role": "user"
+      },
+      {
+        "content": "",
+        "reasoning_content": "(reasoning omitted)",
+        "role": "assistant",
+        "tool_calls": [
+          {
+            "function": {
+              "arguments": "{\"q\":\"Paris\"}",
+              "name": "lookup"
+            },
+            "id": "call-1",
+            "type": "function"
+          }
+        ]
+      },
+      {
+        "content": "ok",
+        "role": "tool",
+        "tool_call_id": "call-1"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "fixture": "tool_round_stream",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "b884a55376364bbc8728ff2e475b037d71c88304878d1f6d118b1d47b2acb1ca",
+  "wire": "chat"
+}

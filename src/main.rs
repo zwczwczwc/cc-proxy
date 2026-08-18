@@ -7,6 +7,12 @@ mod responses;
 mod routes;
 mod sse;
 
+// Test-only modules (golden snapshots + shared fixtures). Never shipped.
+#[cfg(test)]
+mod golden;
+#[cfg(test)]
+mod test_support;
+
 use axum::extract::DefaultBodyLimit;
 use std::sync::Arc;
 use tokio::signal;

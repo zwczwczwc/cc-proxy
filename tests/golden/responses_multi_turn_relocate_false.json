@@ -1,0 +1,62 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "u1",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "a1",
+            "type": "output_text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "u2",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "arguments": "{\"path\":\"/tmp/x\"}",
+        "call_id": "call-1",
+        "name": "read_file",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call-1",
+        "output": "file contents",
+        "type": "function_call_output"
+      },
+      {
+        "content": [
+          {
+            "text": "u3",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "instructions": "You are a helpful coding assistant.\n<env>\nWorking directory: /home/user\nToday's date: 2026-06-22\nPlatform: linux\ngitStatus: M foo.rs\n</env>",
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "multi_turn",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "7bb342659803907ba3e8cfc6cc55b71a4da52669750d02c2863b4a8952429aa4",
+  "wire": "responses"
+}

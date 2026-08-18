@@ -1,0 +1,32 @@
+{
+  "body": {
+    "max_completion_tokens": 4096,
+    "max_tokens": null,
+    "messages": [
+      {
+        "content": "You are a helpful coding assistant.\n<env>\nToday's date: 2026-06-22\nWorking directory: /tmp\n</env>",
+        "role": "system"
+      },
+      {
+        "content": "hello",
+        "role": "user"
+      },
+      {
+        "content": "hi",
+        "role": "assistant"
+      },
+      {
+        "content": "what now",
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": false
+  },
+  "fixture": "env_system",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "eed7b247af271ebe2b675e0b301319b13904a6f67a143450768ba488e9f7c23b",
+  "wire": "chat"
+}
