@@ -44,6 +44,18 @@ fn get_reasoning_fields(model: &str, config: &Config) -> (String, Vec<String>) {
     )
 }
 
+/// Look up the provider's declarative cache policy for a model — one lookup,
+/// passed down to the Responses handlers. `None`/off ⇒ every cache-usage path
+/// takes its Legacy branch. Phase 2b declares no policy in config.toml, so
+/// this always returns `None` here; the gate is the policy, never a
+/// provider-name string.
+fn cache_policy_for(config: &Config, model: &str) -> Option<crate::cache::CachePolicy> {
+    config
+        .model_profile(model)
+        .and_then(|profile| config.provider_config(&profile.provider))
+        .and_then(|provider| provider.cache_policy.clone())
+}
+
 pub fn routes(
     client: Arc<DeepSeekClient>,
     official_client: Arc<DeepSeekClient>,
@@ -85,6 +97,7 @@ async fn handle_messages(
         crate::anthropic::converter::map_model_to_upstream_for_responses(&model, &config);
     let upstream_client = select_client(&upstream_model, &config, &client, &official_client);
     if config.wire_api_for_model(&upstream_model) == WireApi::Responses {
+        let cache_policy = cache_policy_for(&config, &upstream_model);
         let responses_req = match crate::responses::convert_request(&req, &config) {
             Ok(request) => request,
             Err(e) => return (StatusCode::BAD_REQUEST, Json(serde_json::json!({"type":"error","error":{"type":"invalid_request_error","message":e.to_string()}}))).into_response(),
@@ -99,12 +112,13 @@ async fn handle_messages(
                 msg_id,
                 responses_req.request_id.clone(),
                 byte_stream,
+                cache_policy,
             )
             .into_response();
         }
         return match upstream_client.responses_completion(&responses_req).await {
             Ok(value) => match serde_json::from_value::<crate::responses::types::ResponsesResponse>(value) {
-                Ok(response) => match crate::responses::convert_response(&response, &upstream_model, &msg_id) { Ok(result) => (StatusCode::OK, Json(result)).into_response(), Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response() },
+                Ok(response) => match crate::responses::convert_response(&response, &upstream_model, &msg_id, cache_policy.as_ref()) { Ok(result) => (StatusCode::OK, Json(result)).into_response(), Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response() },
                 Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
             },
             Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),

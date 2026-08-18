@@ -2,6 +2,7 @@ use crate::anthropic::types::{
     ContentBlockDeltaData, ContentBlockStartData, ErrorData, MessageDeltaData, MessageStartData,
     SseEvent, StreamUsage,
 };
+use crate::cache::{responses_usage_view_from_buckets, CachePolicy};
 use axum::response::sse::{Event, Sse};
 use futures_util::Stream;
 use std::{
@@ -12,22 +13,33 @@ use std::{
 };
 use tokio::sync::mpsc;
 
-fn log_cache_stats(model: &str, usage: &StreamUsage, status: &str) {
-    let stats = crate::responses::response::cache_stats_from_values(
+fn log_cache_stats(
+    model: &str,
+    usage: &StreamUsage,
+    status: &str,
+    cache_policy: Option<&CachePolicy>,
+) {
+    // Single policy-gated selector over the already-extracted buckets: Legacy
+    // (default — policy None/off) reproduces the historical numbers exactly;
+    // Raw (explicit usage source) reports the canonical `CacheStats` buckets.
+    // The wire (`MessageDelta.usage`) is built from the same read/creation
+    // buckets, so log and wire can never disagree.
+    let view = responses_usage_view_from_buckets(
         usage.input_tokens,
         usage.cache_read_input_tokens,
         usage.cache_creation_input_tokens,
+        cache_policy,
     );
     tracing::info!(
         model = %model,
         status,
         upstream_http_status = 200u16,
-        input_tokens = ?stats.input_tokens,
+        input_tokens = ?view.input,
         output_tokens = ?usage.output_tokens,
-        cache_read_input_tokens = ?stats.cache_read_input_tokens,
-        cache_creation_input_tokens = ?stats.cache_creation_input_tokens,
-        cache_miss_input_tokens = ?stats.cache_miss_input_tokens,
-        hit_rate_percent = ?stats.hit_rate_percent,
+        cache_read_input_tokens = ?view.read,
+        cache_creation_input_tokens = ?view.creation,
+        cache_miss_input_tokens = ?view.miss,
+        hit_rate_percent = ?view.hit_rate,
         "Responses cache stats"
     );
 }
@@ -533,6 +545,7 @@ pub fn process_stream(
     msg_id: String,
     request_id: String,
     body_stream: impl Stream<Item = Result<bytes::Bytes, reqwest::Error>> + Send + Unpin + 'static,
+    cache_policy: Option<CachePolicy>,
 ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     let (tx, rx) = mpsc::channel(256);
     let stats_model = model.clone();
@@ -629,6 +642,7 @@ pub fn process_stream(
                                 .unwrap_or("incomplete")
                                 .strip_prefix("response.")
                                 .unwrap_or("incomplete"),
+                            cache_policy.as_ref(),
                         );
                     }
                     tracing::info!(
@@ -1204,5 +1218,127 @@ mod tests {
             "delta": "late"
         }));
         assert!(events.is_empty());
+    }
+
+    // --- Phase 2b.3: stream cache-usage coverage ---
+
+    #[test]
+    fn terminal_usage_reads_cache_buckets_from_completed() {
+        // Feed a `response.completed` with nested cached_tokens + cache_write_tokens
+        // (and a top-level cache_write_tokens fallback) through the terminal
+        // extractor; assert the StreamUsage read/creation buckets that feed both
+        // the log view and the wire `MessageDelta.usage`.
+        let completed = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "output_tokens": 12,
+                    "input_tokens_details": {
+                        "cached_tokens": 80,
+                        "cache_write_tokens": 3
+                    },
+                    "cache_write_tokens": 9
+                }
+            }
+        });
+        let usage = terminal_usage(&completed).expect("completed usage present");
+        assert_eq!(usage.input_tokens, Some(100));
+        assert_eq!(usage.output_tokens, Some(12));
+        assert_eq!(
+            usage.cache_read_input_tokens,
+            Some(80),
+            "read = input_tokens_details.cached_tokens"
+        );
+        assert_eq!(
+            usage.cache_creation_input_tokens,
+            Some(3),
+            "creation = nested cache_write_tokens (top-level is only a fallback)"
+        );
+
+        // Top-level-only write is the explicit fallback when nested is absent.
+        let top_level = serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "usage": {
+                    "input_tokens": 100,
+                    "input_tokens_details": {"cached_tokens": 80},
+                    "cache_write_tokens": 9
+                }
+            }
+        });
+        let usage = terminal_usage(&top_level).expect("completed usage present");
+        assert_eq!(usage.cache_creation_input_tokens, Some(9));
+    }
+
+    #[test]
+    fn stream_cache_view_legacy_matches_non_stream_and_log_buckets() {
+        // The stream selector (over extracted buckets) under the default None
+        // policy must reproduce the exact historical log numbers: read, clamped
+        // miss, and hit rate.
+        let legacy =
+            crate::cache::responses_usage_view_from_buckets(Some(100), Some(80), Some(3), None);
+        assert_eq!(legacy.read, Some(80));
+        assert_eq!(legacy.creation, Some(3));
+        assert_eq!(legacy.miss, Some(17));
+        assert_eq!(legacy.hit_rate, Some(80.0));
+
+        // Same buckets through the non-stream selector must agree.
+        let usage = crate::responses::types::ResponsesUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(12),
+            input_tokens_details: Some(crate::responses::types::InputTokenDetails {
+                cached_tokens: Some(80),
+                cache_write_tokens: Some(3),
+            }),
+            cache_write_tokens: None,
+        };
+        let non_stream = crate::cache::responses_usage_view(Some(&usage), None);
+        assert_eq!(legacy, non_stream);
+    }
+
+    #[test]
+    fn stream_cache_view_raw_under_opt_in_uses_guarded_miss() {
+        // Explicit policy on the stream path: raw projection with a guarded miss
+        // (never negative), while legacy clamps.
+        let policy = crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::TopLevelCachedTokens,
+            upstream: None,
+        };
+        // Consistent data: miss = input - read - creation.
+        let raw = crate::cache::responses_usage_view_from_buckets(
+            Some(100),
+            Some(80),
+            Some(3),
+            Some(&policy),
+        );
+        assert_eq!(raw.read, Some(80));
+        assert_eq!(raw.creation, Some(3));
+        assert_eq!(raw.miss, Some(17));
+        assert_eq!(raw.hit_rate, Some(80.0));
+
+        // Inconsistent data (cached > prompt): raw keeps miss unknown; the
+        // legacy branch clamps it to zero — never a negative.
+        let raw_inconsistent = crate::cache::responses_usage_view_from_buckets(
+            Some(50),
+            Some(70),
+            Some(0),
+            Some(&policy),
+        );
+        assert_eq!(raw_inconsistent.miss, None);
+        let legacy_inconsistent =
+            crate::cache::responses_usage_view_from_buckets(Some(50), Some(70), Some(0), None);
+        assert_eq!(legacy_inconsistent.miss, Some(0));
+    }
+
+    #[test]
+    fn terminal_usage_missing_usage_is_none_not_a_miss() {
+        // A terminal event without a usage object yields None (the log is
+        // skipped, and the wire MessageDelta.usage is None) — never a miss.
+        let completed_without_usage = serde_json::json!({
+            "type": "response.completed",
+            "response": {}
+        });
+        assert!(terminal_usage(&completed_without_usage).is_none());
     }
 }

@@ -2,11 +2,18 @@
 //
 // Provider-neutral raw cache telemetry.
 //
-// Phase 2 scope: pure mapping functions only. Nothing in this module is wired
-// into production logs or outbound wire behavior — every bucket is opt-in by a
-// later phase. Existing per-provider adapters (e.g. `responses::response::
-// CacheStats`) are intentionally left untouched so providers that have not
-// opted in see zero output change.
+// Phase 2 scope: pure mapping functions + a policy-gated selector. As of
+// Phase 2b.3 the Responses path (`responses/response.rs`, `responses/stream.rs`)
+// reads its cache-usage view through `responses_usage_view`, which selects
+// exactly one of two mutually-exclusive modes per request:
+//   * `CacheStatsMode::Legacy` (default — policy `None`/off): reproduces the
+//     pre-existing Responses three-bucket arithmetic byte-for-byte, so
+//     non-opt-in providers see zero log/wire change.
+//   * `CacheStatsMode::Raw` (explicit `cache_policy.usage`): the canonical
+//     `CacheStats` projection (`from_responses_usage`) with a guarded miss and
+//     a raw hit rate.
+// The Chat adapters (`from_chat_usage` / `from_optional_*`) remain unwired;
+// Phase 2b.4 threads them behind the same gate.
 //
 // Semantics:
 // - `input_tokens`          : prompt / input tokens as reported upstream.
@@ -32,10 +39,6 @@ use sha2::{Digest, Sha256};
 
 /// Which upstream usage shape produced a `CacheStats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "telemetry source marker; wired in a later phase")
-)]
 pub(crate) enum CacheSource {
     /// OpenAI-compatible chat completions usage (Kimi / OpenAI / DeepSeek / GLM shapes).
     #[default]
@@ -46,13 +49,6 @@ pub(crate) enum CacheSource {
 
 /// Raw, provider-neutral cache telemetry buckets.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "provider-neutral cache telemetry; wired in a later phase"
-    )
-)]
 pub(crate) struct CacheStats {
     pub(crate) input_tokens: Option<u32>,
     pub(crate) cache_read_tokens: Option<u32>,
@@ -110,10 +106,6 @@ impl CachePolicy {
     ///
     /// `cache_usage_enabled() == false` is the default; a provider only reports
     /// cache usage once its policy names a concrete usage source.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "usage selector; wired in a later phase")
-    )]
     pub fn cache_usage_enabled(&self) -> bool {
         !matches!(self.usage, UsagePolicy::Off)
     }
@@ -223,10 +215,6 @@ pub(crate) fn from_chat_usage(usage: &ChatUsage) -> CacheStats {
 /// `cache_write_tokens` only ever comes from an explicit upstream write field
 /// (nested `input_tokens_details.cache_write_tokens`, falling back to the
 /// top-level `cache_write_tokens`); the miss bucket is derived as the remainder.
-#[cfg_attr(
-    not(test),
-    expect(dead_code, reason = "usage adapter; wired in a later phase")
-)]
 pub(crate) fn from_responses_usage(usage: &ResponsesUsage) -> CacheStats {
     let details = usage.input_tokens_details.as_ref();
     let read = details.and_then(|details| details.cached_tokens);
@@ -276,6 +264,154 @@ fn derive_miss(input: Option<u32>, read: Option<u32>, write: Option<u32>) -> Opt
         Some(input - consumed)
     } else {
         None
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Responses usage view selector (Phase 2b.3).
+//
+// Exactly ONE mode is computed per request — `Legacy` or `Raw` — decided by
+// `CacheStatsMode::from_policy`. The view is the single source for the log
+// buckets (and, via its read/creation fields, the wire), so log and wire can
+// never disagree and a request never reports cache usage twice.
+// ---------------------------------------------------------------------------
+
+/// How a request's cache-usage telemetry is computed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CacheStatsMode {
+    /// Pre-existing Responses three-bucket arithmetic (clamped miss, hit rate
+    /// `0.0` on zero input). Default: policy `None` or `usage: off`.
+    Legacy,
+    /// Canonical `CacheStats` projection (guarded miss, raw hit rate).
+    Raw,
+}
+
+impl CacheStatsMode {
+    /// The mode selected by an optional cache policy. `None`/off ⇒ `Legacy`;
+    /// an explicit usage source ⇒ `Raw`. This is the only gate — there is no
+    /// provider-string check anywhere (G7).
+    pub(crate) fn from_policy(policy: Option<&CachePolicy>) -> Self {
+        match policy {
+            Some(policy) if policy.cache_usage_enabled() => CacheStatsMode::Raw,
+            _ => CacheStatsMode::Legacy,
+        }
+    }
+}
+
+/// Normalized Responses cache-usage view (input / read / creation / miss /
+/// hit rate).
+///
+/// `read` comes from `input_tokens_details.cached_tokens`; `creation` only from
+/// an explicit `cache_write_tokens` (nested, then top-level fallback); `miss`
+/// is derived and never negative; absent usage ⇒ an empty view (never a
+/// fabricated miss — an HTTP error or a missing usage object is not a miss).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct ResponsesUsageView {
+    pub(crate) input: Option<u32>,
+    pub(crate) read: Option<u32>,
+    pub(crate) creation: Option<u32>,
+    pub(crate) miss: Option<u32>,
+    pub(crate) hit_rate: Option<f64>,
+}
+
+impl ResponsesUsageView {
+    fn empty() -> Self {
+        ResponsesUsageView {
+            input: None,
+            read: None,
+            creation: None,
+            miss: None,
+            hit_rate: None,
+        }
+    }
+}
+
+/// Non-stream selector: map a typed `ResponsesUsage` (plus policy) into the
+/// view. `None` usage (HTTP error / timeout / missing usage) yields an empty
+/// view — never a miss bucket.
+pub(crate) fn responses_usage_view(
+    usage: Option<&ResponsesUsage>,
+    policy: Option<&CachePolicy>,
+) -> ResponsesUsageView {
+    let Some(usage) = usage else {
+        return ResponsesUsageView::empty();
+    };
+    match CacheStatsMode::from_policy(policy) {
+        CacheStatsMode::Raw => {
+            // Canonical raw projection (the `CacheStats` adapter), plus a raw
+            // hit rate. Only reachable with an explicit policy usage source;
+            // config.toml does not declare one in Phase 2b.
+            let stats = from_responses_usage(usage);
+            ResponsesUsageView {
+                input: stats.input_tokens,
+                read: stats.cache_read_tokens,
+                creation: stats.cache_write_tokens,
+                miss: stats.cache_miss_tokens,
+                hit_rate: raw_hit_rate(stats.input_tokens, stats.cache_read_tokens),
+            }
+        }
+        CacheStatsMode::Legacy => {
+            let details = usage.input_tokens_details.as_ref();
+            responses_usage_view_from_buckets(
+                usage.input_tokens,
+                details.and_then(|details| details.cached_tokens),
+                details
+                    .and_then(|details| details.cache_write_tokens)
+                    .or(usage.cache_write_tokens),
+                None,
+            )
+        }
+    }
+}
+
+/// Stream selector: build the view from buckets already extracted by the SSE
+/// terminal handler. Shares the same mode selection with
+/// [`responses_usage_view`], so streamed and non-streamed responses report
+/// cache usage identically for a given policy.
+pub(crate) fn responses_usage_view_from_buckets(
+    input: Option<u32>,
+    read: Option<u32>,
+    creation: Option<u32>,
+    policy: Option<&CachePolicy>,
+) -> ResponsesUsageView {
+    match CacheStatsMode::from_policy(policy) {
+        CacheStatsMode::Raw => ResponsesUsageView {
+            input,
+            read,
+            creation,
+            miss: derive_miss(input, read, creation),
+            hit_rate: raw_hit_rate(input, read),
+        },
+        CacheStatsMode::Legacy => {
+            let miss = input.map(|input| {
+                input
+                    .saturating_sub(read.unwrap_or(0))
+                    .saturating_sub(creation.unwrap_or(0))
+            });
+            let hit_rate = input.map(|input| {
+                if input == 0 {
+                    0.0
+                } else {
+                    read.unwrap_or(0) as f64 / input as f64 * 100.0
+                }
+            });
+            ResponsesUsageView {
+                input,
+                read,
+                creation,
+                miss,
+                hit_rate,
+            }
+        }
+    }
+}
+
+/// Raw hit rate: `read / input * 100`, `None` when input is zero/unknown or
+/// read is unknown (unlike the legacy branch, which clamps zero input to `0.0`).
+fn raw_hit_rate(input: Option<u32>, read: Option<u32>) -> Option<f64> {
+    match (input, read) {
+        (Some(input), Some(read)) if input > 0 => Some(read as f64 / input as f64 * 100.0),
+        _ => None,
     }
 }
 
@@ -722,5 +858,194 @@ mod tests {
         assert_ne!(base, other_provider, "provider change must change key");
         assert_ne!(base, other_model, "model change must change key");
         assert_ne!(base, bound, "upstream binding must namespace the key");
+    }
+
+    // --- Phase 2b.3: Responses usage view selector (legacy vs raw) ---
+
+    fn raw_policy() -> CachePolicy {
+        CachePolicy {
+            usage: UsagePolicy::TopLevelCachedTokens,
+            upstream: None,
+        }
+    }
+
+    #[test]
+    fn cache_stats_mode_follows_policy_only() {
+        assert_eq!(CacheStatsMode::from_policy(None), CacheStatsMode::Legacy);
+        assert_eq!(
+            CacheStatsMode::from_policy(Some(&CachePolicy {
+                usage: UsagePolicy::Off,
+                upstream: None,
+            })),
+            CacheStatsMode::Legacy,
+            "explicit usage:off is still legacy (never activates)"
+        );
+        assert_eq!(
+            CacheStatsMode::from_policy(Some(&raw_policy())),
+            CacheStatsMode::Raw
+        );
+    }
+
+    #[test]
+    fn responses_usage_view_default_off_matches_legacy_three_bucket_baseline() {
+        let usage = responses_usage(json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 70, "cache_write_tokens": 5},
+        }));
+        // No policy ⇒ Legacy mode with the exact old numbers.
+        let view = responses_usage_view(Some(&usage), None);
+        assert_eq!(view.input, Some(100));
+        assert_eq!(
+            view.read,
+            Some(70),
+            "read = input_tokens_details.cached_tokens"
+        );
+        assert_eq!(
+            view.creation,
+            Some(5),
+            "write only from explicit cache_write_tokens"
+        );
+        assert_eq!(view.miss, Some(25), "legacy miss = input - read - creation");
+        assert_eq!(view.hit_rate, Some(70.0));
+
+        // An explicitly off policy must behave byte-identically to None.
+        let off = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+        };
+        assert_eq!(
+            responses_usage_view(Some(&usage), Some(&off)),
+            view,
+            "usage:off must equal policy None"
+        );
+    }
+
+    #[test]
+    fn responses_usage_view_raw_under_opt_in_uses_cache_stats_projection() {
+        let usage = responses_usage(json!({
+            "input_tokens": 100,
+            "output_tokens": 20,
+            "input_tokens_details": {"cached_tokens": 70, "cache_write_tokens": 5},
+        }));
+        let view = responses_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(view.input, Some(100));
+        assert_eq!(view.read, Some(70));
+        assert_eq!(view.creation, Some(5));
+        assert_eq!(view.miss, Some(25));
+        assert_eq!(view.hit_rate, Some(70.0));
+        // The raw projection must be exactly `from_responses_usage` (the
+        // canonical `CacheStats` adapter).
+        let stats = from_responses_usage(&usage);
+        assert_eq!(view.read, stats.cache_read_tokens);
+        assert_eq!(view.creation, stats.cache_write_tokens);
+        assert_eq!(view.miss, stats.cache_miss_tokens);
+    }
+
+    #[test]
+    fn responses_usage_view_legacy_clamps_where_raw_stays_unknown() {
+        // cached > prompt: legacy saturates to 0; raw refuses to fabricate a
+        // negative and reports unknown miss.
+        let usage = responses_usage(json!({
+            "input_tokens": 50,
+            "input_tokens_details": {"cached_tokens": 70, "cache_write_tokens": 0},
+        }));
+        let legacy = responses_usage_view(Some(&usage), None);
+        assert_eq!(
+            legacy.miss,
+            Some(0),
+            "legacy preserves the clamped-to-zero behavior"
+        );
+        assert_eq!(legacy.hit_rate, Some(140.0), "legacy hit rate = read/input");
+
+        let raw = responses_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(
+            raw.miss, None,
+            "raw must never fabricate a negative/clamped miss"
+        );
+        assert_eq!(raw.hit_rate, Some(140.0));
+    }
+
+    #[test]
+    fn responses_usage_view_none_usage_is_empty_never_a_miss() {
+        // HTTP error / timeout / missing usage object ⇒ empty view in BOTH
+        // modes; it must never surface as a cache miss or fabricated zero.
+        let legacy = responses_usage_view(None, None);
+        let raw = responses_usage_view(None, Some(&raw_policy()));
+        let empty = ResponsesUsageView {
+            input: None,
+            read: None,
+            creation: None,
+            miss: None,
+            hit_rate: None,
+        };
+        assert_eq!(legacy, empty);
+        assert_eq!(raw, empty);
+    }
+
+    #[test]
+    fn responses_usage_view_creation_only_from_explicit_write() {
+        // No write field anywhere ⇒ creation None, never fabricated from
+        // `input - read`.
+        let usage = responses_usage(json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 70},
+        }));
+        let legacy = responses_usage_view(Some(&usage), None);
+        assert_eq!(legacy.creation, None);
+        assert_eq!(legacy.miss, Some(30));
+        let raw = responses_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(raw.creation, None);
+        assert_eq!(raw.miss, Some(30));
+
+        // Top-level `cache_write_tokens` is the explicit fallback.
+        let top = responses_usage(json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 70},
+            "cache_write_tokens": 5,
+        }));
+        assert_eq!(
+            responses_usage_view(Some(&top), Some(&raw_policy())).creation,
+            Some(5)
+        );
+    }
+
+    #[test]
+    fn responses_usage_view_zero_input_hit_rate_differs_legacy_vs_raw() {
+        let usage = responses_usage(json!({
+            "input_tokens": 0,
+            "input_tokens_details": {"cached_tokens": 0},
+        }));
+        let legacy = responses_usage_view(Some(&usage), None);
+        assert_eq!(
+            legacy.hit_rate,
+            Some(0.0),
+            "legacy clamps zero input to 0.0"
+        );
+        assert_eq!(legacy.miss, Some(0));
+        let raw = responses_usage_view(Some(&usage), Some(&raw_policy()));
+        assert_eq!(
+            raw.hit_rate, None,
+            "raw hit rate is unknown when input is zero"
+        );
+        assert_eq!(raw.miss, Some(0), "input=0, read=0 ⇒ miss 0 (consistent)");
+    }
+
+    #[test]
+    fn responses_usage_view_from_buckets_matches_non_stream_selector() {
+        // Stream path uses the same selector over already-extracted buckets, so
+        // streamed and non-streamed responses report identically.
+        let usage = responses_usage(json!({
+            "input_tokens": 100,
+            "input_tokens_details": {"cached_tokens": 70, "cache_write_tokens": 5},
+        }));
+        let via_usage = responses_usage_view(Some(&usage), Some(&raw_policy()));
+        let via_buckets =
+            responses_usage_view_from_buckets(Some(100), Some(70), Some(5), Some(&raw_policy()));
+        assert_eq!(via_usage, via_buckets);
+
+        let legacy_usage = responses_usage_view(Some(&usage), None);
+        let legacy_buckets = responses_usage_view_from_buckets(Some(100), Some(70), Some(5), None);
+        assert_eq!(legacy_usage, legacy_buckets);
     }
 }
