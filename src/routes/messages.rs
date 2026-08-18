@@ -69,12 +69,15 @@ pub fn routes(
 /// Select the upstream client for a model.
 ///
 /// Routing is declarative (Phase 3 P3-A): a model whose provider binds the
-/// `"official"` upstream via `cache_policy.upstream` goes to the official
-/// Moonshot (Kimi For Coding) client; everything else goes to the default
-/// eswitch upstream. `Config::provider_config` resolves the legacy
-/// `moonshot-official` provider alias to the canonical `moonshot` config, so
-/// pre-policy configs keep resolving cleanly. There is no provider-name
-/// string match here (G7): the policy binding is the only gate.
+/// `"official"` upstream — via `cache_policy.upstream` or the legacy default
+/// binding carried by the `moonshot-official` provider name — goes to the
+/// official Moonshot (Kimi For Coding) client; everything else goes to the
+/// default eswitch upstream. `Config::effective_upstream_binding` resolves
+/// the effective binding (explicit policy > legacy default binding > eswitch)
+/// and `Config::provider_config` resolves the legacy `moonshot-official`
+/// provider alias to the canonical `moonshot` config, so pre-policy configs
+/// keep resolving cleanly. There is no provider-name string match here (G7):
+/// the binding resolution is the only gate.
 fn select_client<'a>(
     model: &str,
     config: &Config,
@@ -83,9 +86,7 @@ fn select_client<'a>(
 ) -> &'a Arc<DeepSeekClient> {
     let bound_official = config
         .model_profile(model)
-        .and_then(|p| config.provider_config(&p.provider))
-        .and_then(|pc| pc.cache_policy.as_ref())
-        .and_then(|cp| cp.upstream.as_deref())
+        .and_then(|p| config.effective_upstream_binding(&p.provider))
         == Some("official");
     if bound_official {
         official_client
@@ -389,5 +390,109 @@ mod tests {
             effort_enum: None,
         });
         assert_routes_to("kimi-k3", &config, false);
+    }
+
+    /// Build a config that faithfully reproduces the **live production**
+    /// `[providers.moonshot-official]` shape (report 58, M1): an explicit
+    /// provider block with `reasoning_field = "reasoning_content"` and
+    /// **no** `cache_policy`, plus the `kimi-k3` profile bound to
+    /// `moonshot-official`. In this shape `Config::provider_config` hits the
+    /// explicit block directly (the alias fallback never fires), which is
+    /// exactly why the pre-policy `provider == "moonshot-official"` string
+    /// match was the only thing keeping these models on the official
+    /// upstream — and why P3-A's policy-only gate regresses them to eswitch.
+    fn live_shape_config() -> Config {
+        let mut config = test_config();
+        let mut legacy = config.providers["moonshot"].clone();
+        legacy.reasoning_field = "reasoning_content".to_string();
+        legacy.reasoning_field_alt = vec!["reasoning".to_string()];
+        legacy.cache_policy = None; // live block declares no cache_policy
+        config
+            .providers
+            .insert("moonshot-official".to_string(), legacy);
+        let kimi = config
+            .model_profiles
+            .iter_mut()
+            .find(|p| p.name == "kimi-k3")
+            .expect("kimi-k3 profile exists in test_config");
+        kimi.provider = "moonshot-official".to_string();
+        config
+    }
+
+    #[test]
+    fn live_shape_explicit_moonshot_official_block_without_policy_routes_to_official() {
+        // MUST_FIX regression (report 58 M1): the live production config binds
+        // kimi-k3 (L1 Opus + L4 Fable) to `moonshot-official` with an explicit
+        // `[providers.moonshot-official]` block and NO cache_policy. The
+        // origin/master `profile.provider == "moonshot-official"` string match
+        // routed this to the official Moonshot (Kimi For Coding) client; P3-A
+        // must preserve that routing via the legacy default upstream binding
+        // (data, not a provider-name string match) instead of silently
+        // falling back to the default eswitch client.
+        let config = live_shape_config();
+        assert_routes_to("kimi-k3", &config, true);
+        // Non-moonshot models are unaffected and still default to eswitch.
+        assert_routes_to("deepseek-v4-pro", &config, false);
+        assert_routes_to("glm-5.2", &config, false);
+        assert_routes_to("gpt-5.6-luna", &config, false);
+    }
+
+    #[test]
+    fn live_shape_canonical_moonshot_without_policy_keeps_eswitch_routing() {
+        // The canonical `moonshot` provider with no policy must keep default
+        // (eswitch) routing — P3-A's confirmed behavior is unchanged; only
+        // the legacy `moonshot-official` name carries the official default.
+        let config = live_shape_config();
+        let mut canonical = config;
+        let kimi = canonical
+            .model_profiles
+            .iter_mut()
+            .find(|p| p.name == "kimi-k3")
+            .expect("kimi-k3 profile exists");
+        kimi.provider = "moonshot".to_string();
+        assert_routes_to("kimi-k3", &canonical, false);
+    }
+
+    #[test]
+    fn legacy_moonshot_official_explicit_cache_policy_upstream_routes_official() {
+        // Explicit policy precedence: when the legacy `moonshot-official`
+        // provider declares `cache_policy.upstream = "official"`, the explicit
+        // policy wins (priority 1) and the model routes to the official
+        // client — the same result the legacy default binding produces, via
+        // the explicit declarative gate.
+        let mut config = live_shape_config();
+        let legacy = config
+            .providers
+            .get_mut("moonshot-official")
+            .expect("legacy block exists in live_shape_config");
+        legacy.cache_policy = Some(CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+        });
+        assert_routes_to("kimi-k3", &config, true);
+        assert_routes_to("deepseek-v4-pro", &config, false);
+    }
+
+    #[test]
+    fn declared_policy_without_upstream_keeps_legacy_default_official_binding() {
+        // Precedence rule: only an explicit `cache_policy.upstream` value
+        // overrides the legacy default binding for `moonshot-official`. A
+        // declared policy that names no upstream (upstream = None) does NOT
+        // flip the legacy name to eswitch — the legacy default applies unless
+        // an upstream value is explicitly declared. This keeps the live
+        // production routing stable even if an empty cache_policy block is
+        // ever added to the explicit provider.
+        let mut config = live_shape_config();
+        let legacy = config
+            .providers
+            .get_mut("moonshot-official")
+            .expect("legacy block exists in live_shape_config");
+        legacy.cache_policy = Some(CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+        });
+        assert_routes_to("kimi-k3", &config, true);
     }
 }

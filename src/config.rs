@@ -119,6 +119,27 @@ pub struct Config {
 /// `None` (default) keeps eswitch routing.
 const KNOWN_UPSTREAMS: &[&str] = &["official"];
 
+/// A declared legacy provider-name alias.
+///
+/// Maps a historical provider name to the canonical `[providers]` key, and
+/// carries the *pre-policy default upstream binding* for that name — the
+/// routing the merged PR #4 `select_client` string match produced before
+/// Phase 3. This is data (config-resolution metadata), not request-path
+/// routing logic.
+struct ProviderAlias {
+    /// Legacy provider name as referenced by `model_profiles[].provider`.
+    alias: &'static str,
+    /// Canonical provider key in `[providers]`.
+    canonical: &'static str,
+    /// Default upstream binding for this alias name, applied only when the
+    /// resolved provider declares no explicit `cache_policy.upstream`.
+    /// `Some("official")` preserves the pre-policy official Moonshot (Kimi
+    /// For Coding) routing for configs that still use the legacy name — with
+    /// or without an explicit `[providers.moonshot-official]` block. `None`
+    /// means "no default binding" (default eswitch routing).
+    default_upstream: Option<&'static str>,
+}
+
 /// Provider-name aliases that resolve to a canonical provider.
 ///
 /// P3-A canonicalizes the three historically inconsistent names
@@ -128,9 +149,17 @@ const KNOWN_UPSTREAMS: &[&str] = &["official"];
 /// PR #4 `select_client` string match; keeping it here as a *declared alias*
 /// (data, not routing logic) means configs that still name their provider
 /// that way resolve to the canonical config — reasoning fields, effort map
-/// and cache policy — instead of failing lookup. An explicitly-defined
-/// `[providers.moonshot-official]` block takes precedence over the alias.
-const PROVIDER_ALIASES: &[(&str, &str)] = &[("moonshot-official", "moonshot")];
+/// and cache policy — instead of failing lookup, and keep their pre-policy
+/// `official` upstream binding unless they declare an explicit
+/// `cache_policy.upstream`. An explicitly-defined
+/// `[providers.moonshot-official]` block takes precedence over the alias for
+/// config lookup; for routing, an explicit `cache_policy.upstream` takes
+/// precedence over the alias's default binding.
+const PROVIDER_ALIASES: &[ProviderAlias] = &[ProviderAlias {
+    alias: "moonshot-official",
+    canonical: "moonshot",
+    default_upstream: Some("official"),
+}];
 
 impl Config {
     pub fn from_env() -> Self {
@@ -180,9 +209,37 @@ impl Config {
         self.providers.get(provider).or_else(|| {
             PROVIDER_ALIASES
                 .iter()
-                .find(|(alias, _)| *alias == provider)
-                .and_then(|(_, canonical)| self.providers.get(*canonical))
+                .find(|alias| alias.alias == provider)
+                .and_then(|alias| self.providers.get(alias.canonical))
         })
+    }
+
+    /// Resolve the effective upstream binding for a provider as referenced by
+    /// a profile.
+    ///
+    /// Declarative and data-driven — there is no provider-name string match in
+    /// request routing (G7). Priority:
+    /// 1. an explicit `cache_policy.upstream` on the resolved provider config
+    ///    always wins;
+    /// 2. otherwise a *declared* default upstream binding for the provider
+    ///    name (e.g. the legacy `moonshot-official` → `official`) applies —
+    ///    this preserves the pre-policy official Moonshot (Kimi For Coding)
+    ///    routing for configs that still use the legacy name, even when an
+    ///    explicit `[providers.moonshot-official]` block shadows the alias
+    ///    (report 58 M1);
+    /// 3. otherwise `None` = default eswitch routing.
+    pub fn effective_upstream_binding(&self, provider: &str) -> Option<&str> {
+        if let Some(upstream) = self
+            .provider_config(provider)
+            .and_then(|pc| pc.cache_policy.as_ref())
+            .and_then(|cp| cp.upstream.as_deref())
+        {
+            return Some(upstream);
+        }
+        PROVIDER_ALIASES
+            .iter()
+            .find(|alias| alias.alias == provider)
+            .and_then(|alias| alias.default_upstream)
     }
 
     /// Return the configured wire API for a canonical model name or alias.
@@ -234,9 +291,10 @@ impl Config {
         // 3. reasoning_enabled=true with disable_thinking=false:
         //    thinking_param and thinking_type_enabled/disabled must be non-empty
         //    Exception: thinking_param can be None for providers that don't support thinking (e.g. gpt)
+        //    (resolved alias-aware so legacy provider names get the same safety checks)
         for profile in &self.model_profiles {
             if profile.reasoning_enabled {
-                if let Some(provider) = self.providers.get(&profile.provider) {
+                if let Some(provider) = self.provider_config(&profile.provider) {
                     if !provider.disable_thinking {
                         if provider.thinking_param.is_none() {
                             // OK: provider intentionally doesn't support thinking (e.g. gpt-5.6)
@@ -263,9 +321,10 @@ impl Config {
         }
 
         // 4. reasoning_replay=true: reasoning_field must be non-empty
+        //    (resolved alias-aware so legacy provider names get the same safety checks)
         for profile in &self.model_profiles {
             if profile.reasoning_replay {
-                if let Some(provider) = self.providers.get(&profile.provider) {
+                if let Some(provider) = self.provider_config(&profile.provider) {
                     if provider.reasoning_field.is_empty() {
                         panic!(
                             "Provider '{}' (used by '{}') has reasoning_replay=true \
@@ -1173,6 +1232,65 @@ max = "max"
             canonical.effort_map, via_alias.effort_map,
             "alias must resolve to the canonical provider's effort_map"
         );
+    }
+
+    #[test]
+    #[should_panic(expected = "reasoning_field is empty")]
+    fn validate_applies_safety_checks_to_alias_resolved_provider() {
+        // report 58 S1: validate() steps 3/4 must resolve the provider
+        // alias-aware (via `provider_config`), not via a direct
+        // `providers.get(profile.provider)` lookup. A legacy profile that
+        // names `moonshot-official` — with no explicit
+        // `[providers.moonshot-official]` block — resolves to the canonical
+        // `moonshot` provider config, so the reasoning_field safety check
+        // must still fire there. A direct lookup would silently miss the
+        // aliased name and let the invalid config through.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "moonshot".to_string(),
+            ProviderConfig {
+                reasoning_field: String::new(), // empty → must fail step 4
+                reasoning_field_alt: vec![],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: true,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "low".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+                responses_reasoning_summary: None,
+                cache_policy: None,
+            },
+        );
+        let model_profiles = vec![ModelProfile {
+            name: "kimi-k3-legacy".to_string(),
+            provider: "moonshot-official".to_string(), // alias, no explicit block
+            reasoning_enabled: true,
+            reasoning_replay: true, // forces the step-4 reasoning_field check
+            toolcall_requires_reasoning: false,
+            aliases: vec![],
+            wire_api: WireApi::ChatCompletions,
+        }];
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: HashMap::new(),
+            default_model: "kimi-k3-legacy".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config.validate(); // must panic on the aliased provider's empty reasoning_field
     }
 
     // --- Phase 3 (P3-B): cache_policy.effort_enum validation (C12) ---
