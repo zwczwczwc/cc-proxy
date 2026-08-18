@@ -870,11 +870,11 @@ mod tests {
         // T16 (MUST): no session context => no key (fail-closed). A None
         // source must never be replaced by a random / UUID / time fallback.
         assert_eq!(
-            session_key_from_source(None, "moonshot-official", "kimi-k3-turbo", None),
+            session_key_from_source(None, "moonshot", "kimi-k3-turbo", None),
             None
         );
         assert_eq!(
-            session_key_from_source(None, "moonshot-official", "kimi-k3-turbo", Some("official")),
+            session_key_from_source(None, "moonshot", "kimi-k3-turbo", Some("official")),
             None
         );
     }
@@ -883,10 +883,8 @@ mod tests {
     fn same_session_derives_byte_equal_key_across_calls() {
         // T17 (MUST): the same session identity over multiple turns yields a
         // byte-equal key on every call.
-        let first =
-            session_key_from_source(Some("user_123"), "moonshot-official", "kimi-k3-turbo", None);
-        let second =
-            session_key_from_source(Some("user_123"), "moonshot-official", "kimi-k3-turbo", None);
+        let first = session_key_from_source(Some("user_123"), "moonshot", "kimi-k3-turbo", None);
+        let second = session_key_from_source(Some("user_123"), "moonshot", "kimi-k3-turbo", None);
         assert_eq!(first, second);
         assert!(first.is_some());
     }
@@ -897,18 +895,12 @@ mod tests {
         // The derivation is a stateless deterministic hash of inbound signal
         // (no UUID / random / clock), so re-deriving it must yield the same
         // bytes. Exercise it across many repeated calls to mirror restarting.
-        let key =
-            session_key_from_source(Some("user_456"), "moonshot-official", "kimi-k3-turbo", None)
-                .expect("stable source present");
+        let key = session_key_from_source(Some("user_456"), "moonshot", "kimi-k3-turbo", None)
+            .expect("stable source present");
         for _ in 0..100 {
             assert_eq!(
-                session_key_from_source(
-                    Some("user_456"),
-                    "moonshot-official",
-                    "kimi-k3-turbo",
-                    None
-                )
-                .as_deref(),
+                session_key_from_source(Some("user_456"), "moonshot", "kimi-k3-turbo", None)
+                    .as_deref(),
                 Some(key.as_str())
             );
         }
@@ -917,18 +909,8 @@ mod tests {
     #[test]
     fn different_session_yields_different_key() {
         // T19 (MUST, part 1): a different session identity => a different key.
-        let a = session_key_from_source(
-            Some("session-A"),
-            "moonshot-official",
-            "kimi-k3-turbo",
-            None,
-        );
-        let b = session_key_from_source(
-            Some("session-B"),
-            "moonshot-official",
-            "kimi-k3-turbo",
-            None,
-        );
+        let a = session_key_from_source(Some("session-A"), "moonshot", "kimi-k3-turbo", None);
+        let b = session_key_from_source(Some("session-B"), "moonshot", "kimi-k3-turbo", None);
         assert_ne!(a, b);
     }
 
@@ -937,14 +919,10 @@ mod tests {
         // T19 (MUST, part 2): user/token-like source text is hashed — the
         // outbound key never contains the plaintext and has a fixed
         // length/format (first 16 bytes of sha256 => 32 lowercase hex chars).
-        let secret = "sk-ant-0123456789abcdef_secret-user-token";
-        let key = session_key_from_source(
-            Some(secret),
-            "moonshot-official",
-            "kimi-k3-turbo",
-            Some("official"),
-        )
-        .expect("stable source present");
+        let secret = "«redacted:sk-…»";
+        let key =
+            session_key_from_source(Some(secret), "moonshot", "kimi-k3-turbo", Some("official"))
+                .expect("stable source present");
         assert!(
             !key.contains(secret),
             "plaintext must never leak into the key"
@@ -957,13 +935,8 @@ mod tests {
         assert_eq!(key, key.to_lowercase(), "hex digest is lowercase");
         // Deterministic across repeated calls (T18).
         assert_eq!(
-            session_key_from_source(
-                Some(secret),
-                "moonshot-official",
-                "kimi-k3-turbo",
-                Some("official")
-            )
-            .as_deref(),
+            session_key_from_source(Some(secret), "moonshot", "kimi-k3-turbo", Some("official"))
+                .as_deref(),
             Some(key.as_str())
         );
     }
@@ -973,16 +946,12 @@ mod tests {
         // The plan pins the key to (user_id/session, model, provider); changing
         // any of those inputs must change the key, and an upstream binding
         // must namespace the key too.
-        let base = session_key_from_source(Some("u_1"), "moonshot-official", "kimi-k3-turbo", None);
+        let base = session_key_from_source(Some("u_1"), "moonshot", "kimi-k3-turbo", None);
         let other_provider = session_key_from_source(Some("u_1"), "eswitch", "kimi-k3-turbo", None);
         let other_model =
-            session_key_from_source(Some("u_1"), "moonshot-official", "kimi-k3-turbo-next", None);
-        let bound = session_key_from_source(
-            Some("u_1"),
-            "moonshot-official",
-            "kimi-k3-turbo",
-            Some("official"),
-        );
+            session_key_from_source(Some("u_1"), "moonshot", "kimi-k3-turbo-next", None);
+        let bound =
+            session_key_from_source(Some("u_1"), "moonshot", "kimi-k3-turbo", Some("official"));
         assert_ne!(base, other_provider, "provider change must change key");
         assert_ne!(base, other_model, "model change must change key");
         assert_ne!(base, bound, "upstream binding must namespace the key");

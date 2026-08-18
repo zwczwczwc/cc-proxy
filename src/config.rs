@@ -116,9 +116,21 @@ pub struct Config {
 }
 
 /// Recognized upstream binding names for `CachePolicy.upstream`.
-/// `None` (default) keeps eswitch routing. Phase 3 provider canonicalization
-/// may extend this set.
+/// `None` (default) keeps eswitch routing.
 const KNOWN_UPSTREAMS: &[&str] = &["official"];
+
+/// Provider-name aliases that resolve to a canonical provider.
+///
+/// P3-A canonicalizes the three historically inconsistent names
+/// (`fireworks` / `moonshot` / `moonshot-official`) to the single canonical
+/// `moonshot` provider. `moonshot-official` was the pre-policy provider name
+/// routed to the official Moonshot (Kimi For Coding) upstream by the merged
+/// PR #4 `select_client` string match; keeping it here as a *declared alias*
+/// (data, not routing logic) means configs that still name their provider
+/// that way resolve to the canonical config — reasoning fields, effort map
+/// and cache policy — instead of failing lookup. An explicitly-defined
+/// `[providers.moonshot-official]` block takes precedence over the alias.
+const PROVIDER_ALIASES: &[(&str, &str)] = &[("moonshot-official", "moonshot")];
 
 impl Config {
     pub fn from_env() -> Self {
@@ -160,8 +172,17 @@ impl Config {
     }
 
     /// Look up a ProviderConfig by provider name.
+    ///
+    /// Resolves the declared [`PROVIDER_ALIASES`] (e.g. the legacy
+    /// `moonshot-official`) to the canonical provider config. An explicitly
+    /// configured provider block always takes precedence over an alias.
     pub fn provider_config(&self, provider: &str) -> Option<&ProviderConfig> {
-        self.providers.get(provider)
+        self.providers.get(provider).or_else(|| {
+            PROVIDER_ALIASES
+                .iter()
+                .find(|(alias, _)| *alias == provider)
+                .and_then(|(_, canonical)| self.providers.get(*canonical))
+        })
     }
 
     /// Return the configured wire API for a canonical model name or alias.
@@ -183,9 +204,10 @@ impl Config {
 
     /// Startup validation: panic on misconfiguration (no silent failures).
     fn validate(&self) {
-        // 1. Each model_profile.provider must exist in [providers]
+        // 1. Each model_profile.provider must resolve to a [providers] entry
+        //    (directly or via a declared provider alias).
         for profile in &self.model_profiles {
-            if !self.providers.contains_key(&profile.provider) {
+            if self.provider_config(&profile.provider).is_none() {
                 panic!(
                     "Model profile '{}' references unknown provider '{}'. \
                      Available providers: {:?}",
@@ -481,9 +503,14 @@ impl Config {
             },
         );
 
-        // Fireworks (kimi-k3): reasoning field, no thinking.type, effort passthrough
+        // Moonshot (kimi-k3): reasoning field, no thinking.type, effort passthrough.
+        // Phase 3 (P3-A) canonicalized the provider name from the legacy
+        // "fireworks" to "moonshot" — the single canonical name shared with
+        // config.toml and the routing policy. `moonshot-official` remains a
+        // declared alias (see PROVIDER_ALIASES) so pre-policy configs keep
+        // resolving cleanly.
         providers.insert(
-            "fireworks".to_string(),
+            "moonshot".to_string(),
             ProviderConfig {
                 reasoning_field: "reasoning".to_string(),
                 reasoning_field_alt: vec![],
@@ -540,7 +567,7 @@ impl Config {
             },
             ModelProfile {
                 name: "kimi-k3".to_string(),
-                provider: "fireworks".to_string(),
+                provider: "moonshot".to_string(),
                 reasoning_enabled: true,
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,
@@ -576,12 +603,12 @@ low = "high"
 high = "high"
 max = "max"
 
-[providers.fireworks]
+[providers.moonshot]
 reasoning_field = "reasoning"
 disable_thinking = true
 effort_param = "reasoning_effort"
 
-[providers.fireworks.effort_map]
+[providers.moonshot.effort_map]
 low = "low"
 high = "high"
 max = "max"
@@ -596,7 +623,7 @@ aliases = ["deepseek-chat"]
 
 [[model_profiles]]
 name = "kimi-k3"
-provider = "fireworks"
+provider = "moonshot"
 reasoning_enabled = true
 reasoning_replay = true
 aliases = []
@@ -608,7 +635,7 @@ aliases = []
         let providers = cf.providers.expect("providers should be Some");
         assert_eq!(providers.len(), 2);
         assert!(providers.contains_key("deepseek"));
-        assert!(providers.contains_key("fireworks"));
+        assert!(providers.contains_key("moonshot"));
 
         // Verify provider fields
         let ds = &providers["deepseek"];
@@ -621,7 +648,7 @@ aliases = []
             "legacy provider without cache_policy must deserialize to None (cache off)"
         );
 
-        let fw = &providers["fireworks"];
+        let fw = &providers["moonshot"];
         assert_eq!(fw.reasoning_field, "reasoning");
         assert_eq!(fw.reasoning_field_alt, Vec::<String>::new());
         assert!(fw.disable_thinking);
@@ -637,7 +664,7 @@ aliases = []
         assert_eq!(profiles[0].name, "deepseek-v4-pro");
         assert_eq!(profiles[0].provider, "deepseek");
         assert_eq!(profiles[1].name, "kimi-k3");
-        assert_eq!(profiles[1].provider, "fireworks");
+        assert_eq!(profiles[1].provider, "moonshot");
     }
 
     #[test]
@@ -694,31 +721,31 @@ aliases = []
 
     #[test]
     fn test_fireworks_provider_optional_fields() {
-        // Verify that fireworks (no thinking_param) parses correctly
+        // Verify that moonshot (no thinking_param) parses correctly
         let toml_str = r#"
-[providers.fireworks]
+[providers.moonshot]
 reasoning_field = "reasoning"
 disable_thinking = true
 effort_param = "reasoning_effort"
 
-[providers.fireworks.effort_map]
+[providers.moonshot.effort_map]
 low = "low"
 high = "high"
 max = "max"
 
 [[model_profiles]]
 name = "kimi-k3"
-provider = "fireworks"
+provider = "moonshot"
 reasoning_enabled = true
 "#;
 
         let cf: ConfigFile = toml::from_str(toml_str).expect("TOML should parse");
         let providers = cf.providers.expect("providers should be Some");
-        let fw = &providers["fireworks"];
+        let fw = &providers["moonshot"];
         assert_eq!(fw.reasoning_field, "reasoning");
         assert!(
             fw.thinking_param.is_none(),
-            "thinking_param should be None for fireworks"
+            "thinking_param should be None for moonshot"
         );
         assert!(fw.thinking_type_enabled.is_none());
         assert!(fw.thinking_type_disabled.is_none());
@@ -1013,5 +1040,124 @@ max = "max"
         };
         config.build_profile_index();
         config.validate(); // no panic expected
+    }
+
+    // --- Phase 3 (P3-A): provider-name canonicalization (C11) ---
+
+    #[test]
+    fn builtin_defaults_use_single_canonical_moonshot_provider() {
+        // The three inconsistent names (fireworks / moonshot /
+        // moonshot-official) must be unified to the single canonical
+        // `moonshot` provider. No duplicate provider names may remain.
+        let providers = Config::builtin_default_providers();
+        assert!(
+            providers.contains_key("moonshot"),
+            "canonical provider 'moonshot' must exist in builtin defaults"
+        );
+        assert!(
+            !providers.contains_key("fireworks"),
+            "legacy 'fireworks' provider name must be canonicalized away"
+        );
+        let profiles = Config::builtin_default_profiles();
+        let kimi = profiles
+            .iter()
+            .find(|p| p.name == "kimi-k3")
+            .expect("kimi-k3 profile exists in builtin defaults");
+        assert_eq!(
+            kimi.provider, "moonshot",
+            "kimi-k3 must reference the canonical 'moonshot' provider"
+        );
+        // No profile may reference the legacy provider names.
+        for profile in &profiles {
+            assert_ne!(
+                profile.provider, "fireworks",
+                "no profile may reference legacy 'fireworks'"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_alias_resolves_moonshot_official_to_canonical_and_validates() {
+        // `moonshot-official` was the pre-policy provider name routed to the
+        // official Moonshot upstream in the merged PR #4 `select_client`
+        // string match. P3-A keeps it valid as a *declared alias* of the
+        // canonical `moonshot` provider (data, not routing logic): a profile
+        // that still names it resolves to the canonical provider config and
+        // validates cleanly.
+        let mut providers = HashMap::new();
+        providers.insert(
+            "moonshot".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: true,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map: {
+                    let mut m = HashMap::new();
+                    m.insert("low".to_string(), "low".to_string());
+                    m.insert("high".to_string(), "high".to_string());
+                    m.insert("max".to_string(), "max".to_string());
+                    m
+                },
+                responses_reasoning_summary: None,
+                cache_policy: None,
+            },
+        );
+        let model_profiles = vec![
+            ModelProfile {
+                name: "kimi-k3".to_string(),
+                provider: "moonshot".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            },
+            // A legacy profile that still names the provider "moonshot-official".
+            ModelProfile {
+                name: "kimi-k3-legacy".to_string(),
+                provider: "moonshot-official".to_string(),
+                reasoning_enabled: true,
+                reasoning_replay: true,
+                toolcall_requires_reasoning: false,
+                aliases: vec![],
+                wire_api: WireApi::ChatCompletions,
+            },
+        ];
+
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: HashMap::new(),
+            default_model: "kimi-k3".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config.validate(); // must not panic on the aliased profile provider
+
+        // The alias resolves to the canonical provider config.
+        let canonical = config
+            .provider_config("moonshot")
+            .expect("canonical provider resolves");
+        let via_alias = config
+            .provider_config("moonshot-official")
+            .expect("legacy provider alias resolves to canonical config");
+        assert_eq!(
+            canonical.reasoning_field, via_alias.reasoning_field,
+            "alias must resolve to the canonical provider's reasoning_field"
+        );
+        assert_eq!(
+            canonical.effort_map, via_alias.effort_map,
+            "alias must resolve to the canonical provider's effort_map"
+        );
     }
 }

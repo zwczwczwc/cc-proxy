@@ -44,7 +44,7 @@ async fn main() -> anyhow::Result<()> {
         config.moonshot_official_api_key.clone(),
     ));
     if config.moonshot_official_api_key.is_empty() {
-        tracing::warn!("MOONSHOT_OFFICIAL_API_KEY is empty: moonshot-official provider requests will fail upstream auth");
+        tracing::warn!("MOONSHOT_OFFICIAL_API_KEY is empty: moonshot official-upstream requests will fail upstream auth");
     }
 
     // Health check upstream

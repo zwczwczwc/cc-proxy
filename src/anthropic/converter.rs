@@ -342,7 +342,7 @@ mod tests {
             },
         );
         providers.insert(
-            "fireworks".to_string(),
+            "moonshot".to_string(),
             ProviderConfig {
                 reasoning_field: "reasoning".to_string(),
                 reasoning_field_alt: vec![],
@@ -411,7 +411,7 @@ mod tests {
             },
             crate::config::ModelProfile {
                 name: "kimi-k3".to_string(),
-                provider: "fireworks".to_string(),
+                provider: "moonshot".to_string(),
                 reasoning_enabled: true,
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,

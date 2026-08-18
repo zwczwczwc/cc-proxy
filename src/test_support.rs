@@ -9,7 +9,7 @@
 use crate::config::{Config, ModelProfile, ProviderConfig, WireApi};
 use std::collections::HashMap;
 
-/// Deterministic `Config` for tests: deepseek/fireworks(kimi)/glm/gpt
+/// Deterministic `Config` for tests: deepseek/moonshot(kimi)/glm/gpt
 /// providers plus the model profiles the golden fixtures reference.
 pub(crate) fn test_config() -> Config {
     let mut providers = HashMap::new();
@@ -39,7 +39,7 @@ pub(crate) fn test_config() -> Config {
     );
 
     providers.insert(
-        "fireworks".to_string(),
+        "moonshot".to_string(),
         ProviderConfig {
             reasoning_field: "reasoning".to_string(),
             reasoning_field_alt: vec![],
@@ -129,7 +129,7 @@ pub(crate) fn test_config() -> Config {
         },
         ModelProfile {
             name: "kimi-k3".to_string(),
-            provider: "fireworks".to_string(),
+            provider: "moonshot".to_string(),
             reasoning_enabled: true,
             reasoning_replay: true,
             toolcall_requires_reasoning: false,

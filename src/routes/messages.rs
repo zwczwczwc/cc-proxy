@@ -66,18 +66,31 @@ pub fn routes(
         .with_state((client, official_client, config))
 }
 
-/// Select the upstream client for a model: profiles bound to provider
-/// "moonshot-official" go to the official Moonshot (Kimi For Coding) upstream;
-/// everything else goes to the default eswitch upstream.
+/// Select the upstream client for a model.
+///
+/// Routing is declarative (Phase 3 P3-A): a model whose provider binds the
+/// `"official"` upstream via `cache_policy.upstream` goes to the official
+/// Moonshot (Kimi For Coding) client; everything else goes to the default
+/// eswitch upstream. `Config::provider_config` resolves the legacy
+/// `moonshot-official` provider alias to the canonical `moonshot` config, so
+/// pre-policy configs keep resolving cleanly. There is no provider-name
+/// string match here (G7): the policy binding is the only gate.
 fn select_client<'a>(
     model: &str,
     config: &Config,
     client: &'a Arc<DeepSeekClient>,
     official_client: &'a Arc<DeepSeekClient>,
 ) -> &'a Arc<DeepSeekClient> {
-    match config.model_profile(model) {
-        Some(profile) if profile.provider == "moonshot-official" => official_client,
-        _ => client,
+    let bound_official = config
+        .model_profile(model)
+        .and_then(|p| config.provider_config(&p.provider))
+        .and_then(|pc| pc.cache_policy.as_ref())
+        .and_then(|cp| cp.upstream.as_deref())
+        == Some("official");
+    if bound_official {
+        official_client
+    } else {
+        client
     }
 }
 
@@ -256,5 +269,122 @@ async fn handle_messages(
                     .into_response()
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_client;
+    use crate::cache::{CachePolicy, UsagePolicy};
+    use crate::client::DeepSeekClient;
+    use crate::config::Config;
+    use crate::test_support::test_config;
+    use std::sync::Arc;
+
+    fn clients() -> (Arc<DeepSeekClient>, Arc<DeepSeekClient>) {
+        (
+            Arc::new(DeepSeekClient::new(
+                "http://default.test".to_string(),
+                "key".to_string(),
+            )),
+            Arc::new(DeepSeekClient::new(
+                "http://official.test".to_string(),
+                "key".to_string(),
+            )),
+        )
+    }
+
+    fn assert_routes_to(model: &str, config: &Config, expected_official: bool) {
+        let (client, official_client) = clients();
+        let selected = select_client(model, config, &client, &official_client);
+        let is_official = Arc::ptr_eq(selected, &official_client);
+        assert_eq!(
+            is_official,
+            expected_official,
+            "model '{model}' should route to {}",
+            if expected_official {
+                "official"
+            } else {
+                "default"
+            }
+        );
+    }
+
+    #[test]
+    fn legacy_config_without_policy_keeps_default_routing_for_all_models() {
+        // P3-A "old config default behavior": with no cache_policy declared,
+        // every model (including kimi-k3 on the canonical moonshot provider)
+        // keeps the default eswitch routing — identical to pre-P3-A.
+        let config = test_config();
+        assert_routes_to("kimi-k3", &config, false);
+        assert_routes_to("deepseek-v4-pro", &config, false);
+        assert_routes_to("deepseek-v4-flash", &config, false);
+        assert_routes_to("glm-5.2", &config, false);
+        assert_routes_to("gpt-5.6-luna", &config, false);
+    }
+
+    #[test]
+    fn official_client_is_selected_by_policy_upstream_binding() {
+        // P3-A "official client selected by policy": when the canonical
+        // moonshot provider declares cache_policy.upstream = "official", the
+        // kimi-k3 profile routes to the official Moonshot client — the policy
+        // binding replaces the merged `profile.provider == "moonshot-official"`
+        // string match. Non-moonshot providers are unaffected.
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("canonical moonshot provider exists in test_config");
+        moonshot.cache_policy = Some(CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+        });
+        assert_routes_to("kimi-k3", &config, true);
+        assert_routes_to("deepseek-v4-pro", &config, false);
+        assert_routes_to("glm-5.2", &config, false);
+        assert_routes_to("gpt-5.6-luna", &config, false);
+    }
+
+    #[test]
+    fn legacy_moonshot_official_provider_name_still_resolves_to_official_upstream() {
+        // P3-A "existing merged moonshot-official routing preserved": a
+        // profile that still names its provider "moonshot-official" resolves
+        // via the declared alias to the canonical moonshot provider, so once
+        // that provider binds "official" the legacy name routes to the
+        // official client exactly as the pre-policy string match did.
+        let mut config = test_config();
+        let kimi = config
+            .model_profiles
+            .iter_mut()
+            .find(|p| p.name == "kimi-k3")
+            .expect("kimi-k3 profile exists in test_config");
+        kimi.provider = "moonshot-official".to_string();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("canonical moonshot provider exists in test_config");
+        moonshot.cache_policy = Some(CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+        });
+        assert_routes_to("kimi-k3", &config, true);
+    }
+
+    #[test]
+    fn upstream_binding_other_than_official_keeps_default_routing() {
+        // An upstream binding that is not "official" is not a known binding
+        // and must never route to the official client; unknown bindings are
+        // rejected by validate(), so this is defensive: only the exact
+        // "official" name selects the official client.
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("canonical moonshot provider exists in test_config");
+        moonshot.cache_policy = Some(CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("eswitch".to_string()),
+        });
+        assert_routes_to("kimi-k3", &config, false);
     }
 }
