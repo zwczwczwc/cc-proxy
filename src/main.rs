@@ -1,4 +1,5 @@
 mod anthropic;
+mod cache;
 mod client;
 mod config;
 mod conversation;
@@ -6,6 +7,7 @@ mod openai;
 mod reasoning;
 mod responses;
 mod routes;
+mod schema;
 mod sse;
 
 // Test-only modules (golden snapshots + shared fixtures). Never shipped.

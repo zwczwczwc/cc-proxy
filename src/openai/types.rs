@@ -224,6 +224,10 @@ pub struct Usage {
     /// DeepSeek: tokens NOT served from cache (billed at full price)
     #[serde(default)]
     pub prompt_cache_miss_tokens: Option<u32>,
+    /// Kimi (GAP-A): optional top-level cached_tokens. Observed, never assumed
+    /// to be present upstream; falls back to nested details when absent.
+    #[serde(default)]
+    pub cached_tokens: Option<u32>,
     /// Standard OpenAI: cached tokens detail
     #[serde(default)]
     pub prompt_tokens_details: Option<PromptTokensDetails>,
@@ -310,6 +314,53 @@ mod tests {
         };
         let result = delta.get_reasoning("reasoning", &[]);
         assert_eq!(result, Some("stream thinking"));
+    }
+
+    #[test]
+    fn test_usage_parses_top_level_cached_tokens() {
+        // Kimi GAP-A: top-level `cached_tokens` is optional but must be read
+        // when present without breaking deserialization of the nested fields.
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "cached_tokens": 70,
+            "prompt_tokens_details": {"cached_tokens": 70},
+        }))
+        .unwrap();
+        assert_eq!(usage.cached_tokens, Some(70));
+        assert_eq!(
+            usage.prompt_tokens_details.as_ref().unwrap().cached_tokens,
+            Some(70)
+        );
+    }
+
+    #[test]
+    fn test_usage_absent_top_level_cached_tokens_is_none() {
+        // Upstream is never assumed to return top-level cached_tokens.
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+        }))
+        .unwrap();
+        assert_eq!(usage.cached_tokens, None);
+        assert!(usage.prompt_tokens_details.is_none());
+    }
+
+    #[test]
+    fn test_usage_parses_deepseek_hit_and_miss_fields() {
+        let usage: Usage = serde_json::from_value(serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 20,
+            "total_tokens": 120,
+            "prompt_cache_hit_tokens": 60,
+            "prompt_cache_miss_tokens": 40,
+        }))
+        .unwrap();
+        assert_eq!(usage.prompt_cache_hit_tokens, Some(60));
+        assert_eq!(usage.prompt_cache_miss_tokens, Some(40));
+        assert_eq!(usage.cached_tokens, None);
     }
 }
 

@@ -4,8 +4,8 @@ use crate::anthropic::types::{
 };
 use crate::config::Config;
 use crate::conversation::{AssistantPart, Turn};
+use crate::schema::canonical_hash;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ResponsesRequest> {
@@ -115,30 +115,6 @@ pub(crate) fn convert_request_with_relocation(
         input_item_types,
         synthetic_tail_present: !volatile_texts.is_empty(),
     })
-}
-
-fn canonical_hash(value: &Value) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_json(value));
-    hex::encode(&hasher.finalize()[..8])
-}
-
-fn canonical_json(value: &Value) -> Vec<u8> {
-    serde_json::to_vec(&canonicalize(value)).expect("JSON serialization cannot fail")
-}
-
-fn canonicalize(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let sorted = object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonicalize(value)))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
-        _ => value.clone(),
-    }
 }
 
 fn append_synthetic_context_tail(input: &mut Vec<Value>, volatile_texts: &[String]) {
