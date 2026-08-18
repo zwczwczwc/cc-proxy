@@ -324,7 +324,14 @@ impl ChatDelta {
             .collect::<Vec<_>>()
             .join("; ");
         if joined.len() > 500 {
-            format!("{}...[truncated]", &joined[..500])
+            // Char-boundary-safe truncation: slicing `&joined[..500]` at a raw
+            // byte index panics when the upstream-controlled raw content holds
+            // multi-byte UTF-8 ("end byte index 500 is not a char boundary").
+            // That panic fires on the fail-closed error path and drops the SSE
+            // channel, silently truncating the stream. Cap by characters, never
+            // by raw bytes.
+            let truncated: String = joined.chars().take(500).collect();
+            format!("{truncated}...[truncated]")
         } else {
             joined
         }
@@ -699,6 +706,37 @@ mod tests {
         assert!(d.content.text.is_none());
         assert!(d.has_unparseable_content());
         assert!(d.has_no_text());
+    }
+
+    #[test]
+    fn chat_delta_unparseable_preview_multibyte_does_not_panic() {
+        // F2 regression: `unparseable_preview()` sliced `&joined[..500]` at a
+        // raw byte index. When the upstream-controlled raw content contains
+        // multi-byte UTF-8 (here: 300 × 3-byte CJK chars = 900 bytes), byte 500
+        // lands mid-character and the slice PANICS ("end byte index 500 is not
+        // a char boundary") on the exact fail-closed error path — turning the
+        // intended "surface it loudly" into a silently truncated stream.
+        // Char-safe truncation must not panic, must keep the length cap and
+        // still mark the preview as truncated.
+        let long = "中".repeat(300); // 900 bytes, far past the 500 cap
+        let d: ChatDelta = serde_json::from_value(serde_json::json!({
+            "content": {"weird": long}
+        }))
+        .unwrap();
+        let preview = d.unparseable_preview();
+        assert!(
+            preview.ends_with("...[truncated]"),
+            "preview must be marked truncated, got {preview:?}"
+        );
+        assert!(
+            preview.chars().count() <= 500 + "[truncated]".len(),
+            "preview stays bounded: {} chars",
+            preview.chars().count()
+        );
+        assert!(
+            preview.contains("中"),
+            "multi-byte content survives truncation intact: {preview:?}"
+        );
     }
 }
 

@@ -180,6 +180,11 @@ pub fn process_stream(
                                 for event in &final_events {
                                     let _ = tx.send(sse_event_to_axum(event)).await;
                                 }
+                                // F3: finalize already ran for this finish_reason —
+                                // clear the pending marker so the post-loop block
+                                // below (also keyed on pending_finish_reason) does
+                                // NOT emit a second message_delta/message_stop.
+                                pending_finish_reason = None;
                             }
                             done = true;
                             break;
@@ -237,16 +242,15 @@ pub fn process_stream(
                                                     raw = %delta,
                                                     "undecodable chat streaming delta"
                                                 );
-                                                let error_event = sse_event_to_axum(
-                                                    &SseEvent::Error {
+                                                let error_event =
+                                                    sse_event_to_axum(&SseEvent::Error {
                                                         error: crate::anthropic::types::ErrorData {
                                                             error_type: "stream_error".to_string(),
                                                             message: format!(
                                                                 "undecodable streaming delta: {e}"
                                                             ),
                                                         },
-                                                    },
-                                                );
+                                                    });
                                                 if tx.send(error_event).await.is_err() {
                                                     return;
                                                 }
@@ -554,9 +558,7 @@ mod tests {
             .find(|(e, _)| e == "message_start")
             .expect("message_start present");
         assert!(
-            ms.1.get("message")
-                .and_then(|m| m.get("usage"))
-                .is_some(),
+            ms.1.get("message").and_then(|m| m.get("usage")).is_some(),
             "message_start.usage object present: {frames:?}"
         );
         // No error frame on a healthy stream.
@@ -568,7 +570,10 @@ mod tests {
         let types = frame_types(&frames);
         let md = types.iter().position(|t| *t == "message_delta");
         let ms_pos = types.iter().position(|t| *t == "message_stop");
-        assert!(md.is_some() && ms_pos.is_some() && md < ms_pos, "terminal order: {types:?}");
+        assert!(
+            md.is_some() && ms_pos.is_some() && md < ms_pos,
+            "terminal order: {types:?}"
+        );
     }
 
     #[tokio::test]
@@ -586,9 +591,22 @@ mod tests {
             frames.iter().any(|(e, _)| e == "content_block_stop"),
             "content_block_stop missing: {frames:?}"
         );
+        // F3 regression: this is the no-usage body (finish_reason then [DONE],
+        // no usage object). The terminal must be emitted EXACTLY once — a
+        // duplicated message_delta/message_stop is a broken SSE stream.
+        let message_deltas = frames.iter().filter(|(e, _)| e == "message_delta").count();
+        let message_stops = frames.iter().filter(|(e, _)| e == "message_stop").count();
+        assert_eq!(
+            message_deltas, 1,
+            "no-usage stream must emit exactly ONE message_delta, got {message_deltas}: {frames:?}"
+        );
+        assert_eq!(
+            message_stops, 1,
+            "no-usage stream must emit exactly ONE message_stop, got {message_stops}: {frames:?}"
+        );
         assert!(
-            frames.iter().any(|(e, _)| e == "message_stop"),
-            "message_stop missing: {frames:?}"
+            !frames.iter().any(|(e, _)| e == "error"),
+            "no error expected on a healthy no-usage stream: {frames:?}"
         );
     }
 
@@ -631,6 +649,30 @@ mod tests {
         assert!(
             !frames.iter().any(|(e, _)| e == "message_stop"),
             "unknown content shape must NOT yield a clean message_stop over dropped content: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_multibyte_unparseable_content_aborts_not_panic() {
+        // F2 regression at stream level: an unknown content shape containing
+        // multi-byte UTF-8 previously panicked inside `unparseable_preview()`
+        // on the fail-closed path (`&joined[..500]` landed mid-character),
+        // which dropped the SSE channel → silent EOF with no error frame and no
+        // terminal. It must instead produce an observable error frame and abort
+        // — never a clean `message_stop` over dropped content, and never a
+        // panic. 300 × 3-byte CJK chars = 900 bytes, so byte 500 is mid-char.
+        let long = "中".repeat(300);
+        let body = format!(
+            "data: {{\"id\":\"c1\",\"choices\":[{{\"index\":0,\"delta\":{{\"role\":\"assistant\",\"content\":{{\"weird\":\"{long}\"}}}}}}]}}\n\ndata: [DONE]\n\n"
+        );
+        let frames = run_stream(false, "reasoning", &body).await;
+        assert!(
+            frames.iter().any(|(e, _)| e == "error"),
+            "multi-byte unknown content must produce an observable error frame (not a panic/EOF): {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(e, _)| e == "message_stop"),
+            "multi-byte unknown content must NOT yield a clean message_stop: {frames:?}"
         );
     }
 }
