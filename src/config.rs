@@ -120,8 +120,7 @@ impl Config {
             log_level: env::var("RUST_LOG").unwrap_or_else(|_| "info".to_string()),
             moonshot_official_url: env::var("MOONSHOT_OFFICIAL_URL")
                 .unwrap_or_else(|_| "https://api.kimi.com/coding".to_string()),
-            moonshot_official_api_key: env::var("MOONSHOT_OFFICIAL_API_KEY")
-                .unwrap_or_default(),
+            moonshot_official_api_key: env::var("MOONSHOT_OFFICIAL_API_KEY").unwrap_or_default(),
             model_mapping,
             default_model,
             model_profiles,
