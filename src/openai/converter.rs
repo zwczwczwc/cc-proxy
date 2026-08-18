@@ -173,7 +173,7 @@ impl SseStateMachine {
             .get_reasoning(&self.reasoning_field, &self.reasoning_field_alt)
             .is_some();
         if !has_reasoning
-            && delta.content.is_none()
+            && delta.content.is_empty()
             && delta.tool_calls.is_none()
             && delta.role.is_none()
         {
@@ -223,7 +223,7 @@ impl SseStateMachine {
         }
 
         // 2. Process content
-        if let Some(ref text) = delta.content {
+        if let Some(ref text) = delta.content.text {
             if !text.is_empty() {
                 // Close thinking block if open
                 if self.thinking_started {
@@ -647,9 +647,9 @@ mod tests {
     fn usage_only_delta() -> ChatDelta {
         ChatDelta {
             role: None,
-            content: None,
-            reasoning_content: None,
-            reasoning: None,
+            content: Default::default(),
+            reasoning_content: Default::default(),
+            reasoning: Default::default(),
             tool_calls: None,
         }
     }
@@ -823,5 +823,91 @@ mod tests {
         assert_eq!(md.cache_read_input_tokens, None);
         assert_eq!(md.cache_creation_input_tokens, None);
         assert!(matches!(final_events.last(), Some(SseEvent::MessageStop)));
+    }
+
+    // ============ STREAM DELTA SILENT-LOSS REGRESSION (GREEN) ============
+    // kimi-k3-class upstreams send content/reasoning as arrays of parts. These
+    // must decode into the same content-block frames as the string form.
+
+    #[test]
+    fn process_delta_array_content_emits_text_block() {
+        let mut sm = SseStateMachine::new(false, "reasoning_content".into(), vec![], None);
+        let delta: ChatDelta = serde_json::from_value(serde_json::json!({
+            "content": [{"type": "text", "text": "Hello"}, {"type": "text", "text": " world"}]
+        }))
+        .unwrap();
+        let events = sm.process_delta(&delta, None);
+        assert!(
+            matches!(events[0], SseEvent::ContentBlockStart { .. }),
+            "expected ContentBlockStart first: {events:?}"
+        );
+        assert!(matches!(
+            events[1],
+            SseEvent::ContentBlockDelta {
+                delta: ContentBlockDeltaData::TextDelta { .. },
+                ..
+            }
+        ));
+        if let SseEvent::ContentBlockDelta {
+            delta: ContentBlockDeltaData::TextDelta { text },
+            ..
+        } = &events[1]
+        {
+            assert_eq!(
+                text, "Hello world",
+                "array parts concatenate into one text delta"
+            );
+        }
+    }
+
+    #[test]
+    fn process_delta_reasoning_array_goes_to_thinking_not_text() {
+        // A `reasoning` part array must produce a thinking block, never a text
+        // block (thinking is not misread as ordinary text).
+        let mut sm = SseStateMachine::new(true, "reasoning".into(), vec![], None);
+        let delta: ChatDelta = serde_json::from_value(serde_json::json!({
+            "reasoning": [{"type": "reasoning_summary_text", "summary_text": "let me think"}]
+        }))
+        .unwrap();
+        let events = sm.process_delta(&delta, None);
+        assert!(matches!(
+            events[0],
+            SseEvent::ContentBlockStart {
+                content_block: ContentBlockStartData::Thinking { .. },
+                ..
+            }
+        ));
+        assert!(matches!(
+            events[1],
+            SseEvent::ContentBlockDelta {
+                delta: ContentBlockDeltaData::ThinkingDelta { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn process_delta_tool_calls_not_treated_as_text() {
+        // Tool-call deltas still route to tool_use blocks, untouched by the
+        // tolerant content decode.
+        let mut sm = SseStateMachine::new(false, "reasoning_content".into(), vec![], None);
+        let delta: ChatDelta = serde_json::from_value(serde_json::json!({
+            "tool_calls": [{
+                "index": 0, "id": "call_1", "type": "function",
+                "function": {"name": "get_weather", "arguments": "{\"city\":\"SF\"}"}
+            }]
+        }))
+        .unwrap();
+        let events = sm.process_delta(&delta, None);
+        assert!(
+            matches!(
+                events[0],
+                SseEvent::ContentBlockStart {
+                    content_block: ContentBlockStartData::ToolUse { .. },
+                    ..
+                }
+            ),
+            "tool delta must produce a tool_use block, not text: {events:?}"
+        );
     }
 }

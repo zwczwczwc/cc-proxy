@@ -214,13 +214,83 @@ pub fn process_stream(
                                 let delta = choice.get("delta");
 
                                 if let Some(delta) = delta {
-                                    let chat_delta: Option<crate::openai::types::ChatDelta> =
-                                        serde_json::from_value(delta.clone()).ok();
-
                                     let output_tokens =
                                         usage.as_ref().and_then(|u| u.completion_tokens);
 
+                                    // Tolerant decode: known OpenAI-compatible content
+                                    // shapes (string, content-part array, object wrapper,
+                                    // null) never fail. Anything that cannot be mapped to
+                                    // text is retained in `raw` and surfaced here — never
+                                    // silently dropped (root cause report 84: `from_value
+                                    // .ok()` -> None -> process_delta never runs -> 0 content
+                                    // blocks while the terminal still succeeds).
+                                    let chat_delta: Option<crate::openai::types::ChatDelta> =
+                                        match serde_json::from_value(delta.clone()) {
+                                            Ok(cd) => Some(cd),
+                                            Err(e) => {
+                                                // Fail-closed: a delta we cannot decode at
+                                                // all becomes an observable error frame and
+                                                // the stream terminates on the error instead
+                                                // of silently dropping the chunk.
+                                                tracing::error!(
+                                                    serde_error = %e,
+                                                    raw = %delta,
+                                                    "undecodable chat streaming delta"
+                                                );
+                                                let error_event = sse_event_to_axum(
+                                                    &SseEvent::Error {
+                                                        error: crate::anthropic::types::ErrorData {
+                                                            error_type: "stream_error".to_string(),
+                                                            message: format!(
+                                                                "undecodable streaming delta: {e}"
+                                                            ),
+                                                        },
+                                                    },
+                                                );
+                                                if tx.send(error_event).await.is_err() {
+                                                    return;
+                                                }
+                                                return;
+                                            }
+                                        };
+
                                     if let Some(ref cd) = chat_delta {
+                                        // Surface content the tolerant decoder could not map
+                                        // to text instead of losing it silently.
+                                        if cd.has_unparseable_content() {
+                                            let preview = cd.unparseable_preview();
+                                            if cd.has_no_text() {
+                                                // Total loss for this chunk: fail closed with
+                                                // an observable error frame + error terminal,
+                                                // never a clean message_stop over dropped
+                                                // content (the Phase5B stream bug).
+                                                tracing::error!(
+                                                    raw_preview = %preview,
+                                                    "chat delta carried only unparseable content — aborting stream"
+                                                );
+                                                let error_event = sse_event_to_axum(
+                                                    &SseEvent::Error {
+                                                        error: crate::anthropic::types::ErrorData {
+                                                            error_type: "stream_error".to_string(),
+                                                            message: format!(
+                                                                "streaming delta content could not be decoded: {preview}"
+                                                            ),
+                                                        },
+                                                    },
+                                                );
+                                                if tx.send(error_event).await.is_err() {
+                                                    return;
+                                                }
+                                                return;
+                                            }
+                                            // Partial loss: keep the decodable text, but make
+                                            // the loss observable.
+                                            tracing::warn!(
+                                                raw_preview = %preview,
+                                                "chat delta partially unparseable — text delivered, some content dropped"
+                                            );
+                                        }
+
                                         let events =
                                             state_machine.process_delta(cd, usage.as_ref());
                                         for event in &events {
@@ -364,4 +434,203 @@ pub fn process_stream(
     });
 
     Sse::new(SseEventStream { receiver: rx })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::response::IntoResponse;
+
+    /// Run `process_stream` over a synthetic SSE body and collect the serialized
+    /// wire frames as `(event_name, data_json)` pairs.
+    async fn run_stream(
+        is_reasoning_model: bool,
+        reasoning_field: &str,
+        body: &str,
+    ) -> Vec<(String, serde_json::Value)> {
+        let bytes = bytes::Bytes::from(body.to_string());
+        let stream = futures_util::stream::iter(vec![Ok::<_, reqwest::Error>(bytes)]);
+        let sse = process_stream(
+            "kimi-k3".to_string(),
+            is_reasoning_model,
+            reasoning_field.to_string(),
+            vec![],
+            "msg_test".to_string(),
+            None,
+            stream,
+        );
+        let response = sse.into_response();
+        let body_bytes = axum::body::to_bytes(response.into_body(), 4 * 1024 * 1024)
+            .await
+            .expect("read response body");
+        parse_sse(&String::from_utf8_lossy(&body_bytes))
+    }
+
+    /// Parse an SSE payload into `(event, data)` pairs. Each frame is
+    /// `event: <name>\ndata: <json>\n\n`.
+    fn parse_sse(text: &str) -> Vec<(String, serde_json::Value)> {
+        let mut frames = Vec::new();
+        for block in text.split("\n\n") {
+            let block = block.trim();
+            if block.is_empty() {
+                continue;
+            }
+            let mut event = String::new();
+            let mut data = String::new();
+            for line in block.lines() {
+                if let Some(v) = line.strip_prefix("event: ") {
+                    event = v.to_string();
+                } else if let Some(v) = line.strip_prefix("data: ") {
+                    data.push_str(v);
+                }
+            }
+            if !data.is_empty() {
+                let json: serde_json::Value = serde_json::from_str(&data)
+                    .unwrap_or_else(|e| panic!("bad SSE data frame: {e}: {data}"));
+                frames.push((event, json));
+            }
+        }
+        frames
+    }
+
+    /// Concatenate all `content_block_delta` text deltas into one string.
+    fn concat_text_deltas(frames: &[(String, serde_json::Value)]) -> String {
+        let mut s = String::new();
+        for (event, json) in frames {
+            if event == "content_block_delta" {
+                if let Some(text) = json.pointer("/delta/text") {
+                    if let Some(text) = text.as_str() {
+                        s.push_str(text);
+                    }
+                }
+            }
+        }
+        s
+    }
+
+    fn frame_types(frames: &[(String, serde_json::Value)]) -> Vec<&str> {
+        frames
+            .iter()
+            .map(|(_, j)| j.get("type").and_then(|v| v.as_str()).unwrap_or(""))
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn stream_preserves_array_content_deltas() {
+        // RED (pre-fix): array-valued `content` deltas fail the `ChatDelta`
+        // gate, so the stream emits NO content_block_* frames — only
+        // message_start / message_delta / message_stop (Phase5B symptom).
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\"Hello\"}]}}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":[{\"type\":\"text\",\"text\":\" world\"}]}}]}\n\n",
+            "data: {\"id\":\"c1\",\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":512,\"total_tokens\":632,\"prompt_tokens_details\":{\"cached_tokens\":0}},\"choices\":[]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"length\"}],\"usage\":{\"prompt_tokens\":120,\"completion_tokens\":512,\"total_tokens\":632,\"prompt_tokens_details\":{\"cached_tokens\":0}}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let frames = run_stream(false, "reasoning", body).await;
+
+        assert!(
+            frames.iter().any(|(e, _)| e == "content_block_start"),
+            "content_block_start missing (array content dropped at gate): {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|(e, _)| e == "content_block_delta"),
+            "content_block_delta missing (array content dropped at gate): {frames:?}"
+        );
+        assert_eq!(concat_text_deltas(&frames), "Hello world");
+        // Complete Anthropic terminal: message_delta (usage) then message_stop.
+        assert!(
+            frames.iter().any(|(e, _)| e == "message_delta"),
+            "message_delta missing: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|(e, _)| e == "message_stop"),
+            "message_stop missing: {frames:?}"
+        );
+        // message_start always carries a usage object.
+        let ms = frames
+            .iter()
+            .find(|(e, _)| e == "message_start")
+            .expect("message_start present");
+        assert!(
+            ms.1.get("message")
+                .and_then(|m| m.get("usage"))
+                .is_some(),
+            "message_start.usage object present: {frames:?}"
+        );
+        // No error frame on a healthy stream.
+        assert!(
+            !frames.iter().any(|(e, _)| e == "error"),
+            "no error expected on healthy stream: {frames:?}"
+        );
+        // Terminal ordering: message_delta before message_stop.
+        let types = frame_types(&frames);
+        let md = types.iter().position(|t| *t == "message_delta");
+        let ms_pos = types.iter().position(|t| *t == "message_stop");
+        assert!(md.is_some() && ms_pos.is_some() && md < ms_pos, "terminal order: {types:?}");
+    }
+
+    #[tokio::test]
+    async fn stream_string_content_delta_still_works() {
+        // Control: the standard OpenAI string form must keep working unchanged.
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let frames = run_stream(false, "reasoning", body).await;
+        assert_eq!(concat_text_deltas(&frames), "Hello");
+        assert!(
+            frames.iter().any(|(e, _)| e == "content_block_stop"),
+            "content_block_stop missing: {frames:?}"
+        );
+        assert!(
+            frames.iter().any(|(e, _)| e == "message_stop"),
+            "message_stop missing: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_malformed_delta_emits_error_terminal_not_silent_success() {
+        // A delta that cannot be decoded at all (here: `tool_calls` with a
+        // non-array value) must fail CLOSED: an observable `error` frame and an
+        // aborted stream — never a clean `message_stop` over dropped content.
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"Hello\"}}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"tool_calls\":\"not-an-array\"}}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let frames = run_stream(false, "reasoning", body).await;
+        assert!(
+            frames.iter().any(|(e, _)| e == "error"),
+            "undecodable delta must produce an error frame: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(e, _)| e == "message_stop"),
+            "malformed delta must NOT terminate with a clean message_stop: {frames:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn stream_unknown_content_shape_aborts_not_silent_success() {
+        // A delta whose content decodes but carries no extractable text (unknown
+        // shape) must not yield a successful empty response: error frame +
+        // abort, never a clean `message_stop` over dropped content.
+        let body = concat!(
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":12345}}]}\n\n",
+            "data: {\"id\":\"c1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let frames = run_stream(false, "reasoning", body).await;
+        assert!(
+            frames.iter().any(|(e, _)| e == "error"),
+            "unknown content shape must produce an error frame: {frames:?}"
+        );
+        assert!(
+            !frames.iter().any(|(e, _)| e == "message_stop"),
+            "unknown content shape must NOT yield a clean message_stop over dropped content: {frames:?}"
+        );
+    }
 }
