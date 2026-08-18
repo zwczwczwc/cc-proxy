@@ -121,6 +121,42 @@ fn is_default_replay(value: &ReplayPolicy) -> bool {
     *value == ReplayPolicy::default()
 }
 
+/// Append-only history policy (Phase 4c).
+///
+/// `Off` (the default) keeps the legacy chat encoder byte-for-byte: it may
+/// compact oversized `tool_result` bodies (HEAD/TAIL 4000), drop repeated
+/// tool results for the same `tool_call_id`, and strip orphaned `tool_calls`
+/// from non-final assistant messages. Each of those rewrites a stored
+/// message and busts the upstream prefix cache from that message onwards
+/// (report 34 K2 / OSS F5).
+///
+/// `AppendOnly` opts into **never rewriting already-provided history** on
+/// the wire: orphan `tool_calls` are not deleted, `tool_result` bodies are
+/// not compacted, repeated results are not deduplicated — order, tool IDs
+/// and content bytes are preserved exactly as stored. Activation
+/// additionally requires the canonical `"official"` upstream binding (see
+/// [`CachePolicy::append_only_history_for_upstream`]); it never depends on
+/// a provider-name string (G7). The policy governs **stored-history
+/// preservation only** — the current request's own output control
+/// (`thinking.type` / `reasoning_effort`) and assistant reasoning replay
+/// (`ReplayPolicy`) are untouched.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum HistoryPolicy {
+    /// Legacy: cleanup/compaction/dedup stay enabled (default).
+    #[default]
+    Off,
+    /// Preserve stored history append-only: no orphan cleanup, no tool
+    /// result compaction, no repeated-result dedup.
+    AppendOnly,
+}
+
+/// Whether a [`HistoryPolicy`] is the default (`Off`) — used to omit the
+/// field from serialized config so the default-off surface stays minimal.
+fn is_default_history(value: &HistoryPolicy) -> bool {
+    *value == HistoryPolicy::default()
+}
+
 /// Declarative cache policy attached to a provider via
 /// [`crate::config::ProviderConfig::cache_policy`].
 ///
@@ -200,6 +236,21 @@ pub struct CachePolicy {
     /// changed or resurrected by it.
     #[serde(default, skip_serializing_if = "is_default_replay")]
     pub replay: ReplayPolicy,
+    /// Append-only history policy (Phase 4c).
+    ///
+    /// `Off` (default) keeps the legacy chat encoder byte-for-byte: oversized
+    /// `tool_result` bodies are compacted, repeated results are deduplicated,
+    /// and orphaned `tool_calls` are stripped from non-final assistant
+    /// messages. `AppendOnly` (opt-in, official Kimi upstream only — see
+    /// [`Self::append_only_history_for_upstream`]) never rewrites
+    /// already-provided history: orphan `tool_calls` are kept, `tool_result`
+    /// bodies are not compacted, repeated results are not deduplicated —
+    /// order, tool IDs and content bytes are preserved exactly as stored.
+    /// It governs stored-history preservation only: assistant reasoning
+    /// replay (`Self::replay`) and current-request output control are
+    /// untouched.
+    #[serde(default, skip_serializing_if = "is_default_history")]
+    pub history: HistoryPolicy,
 }
 
 #[inline]
@@ -249,6 +300,24 @@ impl CachePolicy {
     /// request's `thinking.type` / `reasoning_effort` output control.
     pub fn full_assistant_replay_for_upstream(&self, effective_upstream: Option<&str>) -> bool {
         self.replay == ReplayPolicy::FullAssistant && effective_upstream == Some("official")
+    }
+
+    /// Whether this policy opts into append-only stored-history preservation
+    /// (Phase 4c).
+    ///
+    /// Returns `true` only when BOTH hold: this policy declares
+    /// `history = AppendOnly` AND the provider's effective upstream binding
+    /// resolves to `"official"` (Kimi For Coding). Any other route — history
+    /// off, or a provider routed through the default eswitch upstream —
+    /// returns `false` and keeps the legacy cleanup/compaction/dedup
+    /// byte-for-byte (fail-closed). The binding must be resolved data-driven
+    /// (never a provider-name string, G7); the converter calls this with
+    /// [`crate::config::Config::effective_upstream_binding`]. The policy
+    /// governs stored-history preservation only — it never touches the
+    /// current request's `thinking.type` / `reasoning_effort` output control
+    /// nor the assistant reasoning replay policy (`Self::replay`).
+    pub fn append_only_history_for_upstream(&self, effective_upstream: Option<&str>) -> bool {
+        self.history == HistoryPolicy::AppendOnly && effective_upstream == Some("official")
     }
 
     /// Fail-fast startup validation of a provider's `effort_map` outputs
@@ -1035,6 +1104,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         assert!(enabled.cache_usage_enabled());
@@ -1045,6 +1115,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         assert!(
@@ -1081,6 +1152,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         };
@@ -1102,6 +1174,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -1134,6 +1207,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         let mut legacy = HashMap::new();
@@ -1157,6 +1231,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1178,6 +1253,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         let mut map = kimi_effort_map();
@@ -1201,6 +1277,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         let mut map = kimi_effort_map();
@@ -1248,6 +1325,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         let json = serde_json::to_string(&pinned).unwrap();
@@ -1279,6 +1357,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map());
@@ -1300,6 +1379,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: Some("medium".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map());
@@ -1320,6 +1400,7 @@ mod tests {
                     "max".to_string(),
                 ]),
                 replay: crate::cache::ReplayPolicy::Off,
+                history: crate::cache::HistoryPolicy::Off,
                 pinned_effort: Some(pin.to_string()),
             };
             policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1353,6 +1434,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1377,6 +1459,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map_without_low());
@@ -1431,6 +1514,7 @@ mod tests {
             effort_enum: None,
             pinned_effort: None,
             replay: ReplayPolicy::FullAssistant,
+            history: crate::cache::HistoryPolicy::Off,
         };
         assert!(policy.full_assistant_replay_for_upstream(Some("official")));
         assert!(!policy.full_assistant_replay_for_upstream(Some("eswitch")));
@@ -1439,9 +1523,82 @@ mod tests {
         // Replay Off never opts in, even on the official upstream.
         let off = CachePolicy {
             replay: ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             ..policy.clone()
         };
         assert!(!off.full_assistant_replay_for_upstream(Some("official")));
+    }
+
+    // --- Phase 4c: append-only stored-history policy ---
+
+    #[test]
+    fn history_policy_default_is_off() {
+        // Fail-closed default: history is Off unless explicitly opted in, so
+        // the legacy chat encoder (cleanup/compaction/dedup) stays
+        // byte-for-byte for every current config.
+        assert_eq!(HistoryPolicy::default(), HistoryPolicy::Off);
+    }
+
+    #[test]
+    fn history_policy_serde_snake_case_and_default_omission() {
+        // "append_only" round-trips as snake_case; the default-off field is
+        // omitted from serialized config so the opt-in surface stays minimal.
+        let on = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            pinned_effort: None,
+            replay: ReplayPolicy::Off,
+            history: HistoryPolicy::AppendOnly,
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert!(
+            json.contains(r#""history":"append_only""#),
+            "AppendOnly must serialize as snake_case append_only, got: {json}"
+        );
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.history, HistoryPolicy::AppendOnly);
+
+        // Off (the default) is omitted from serialized config.
+        let off = CachePolicy {
+            history: HistoryPolicy::Off,
+            ..on.clone()
+        };
+        let json = serde_json::to_string(&off).unwrap();
+        assert!(
+            !json.contains("history"),
+            "Off must be omitted, got: {json}"
+        );
+        // Unknown history values fail rather than silently defaulting.
+        assert!(serde_json::from_str::<CachePolicy>(r#"{"history":"bogus"}"#).is_err());
+    }
+
+    #[test]
+    fn append_only_history_gates_on_official_binding() {
+        // Fail-closed, data-driven (G7, never a provider-name string):
+        // AppendOnly applies ONLY on the canonical "official" upstream
+        // binding — never on eswitch/None, and never for the Off policy.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            pinned_effort: None,
+            replay: ReplayPolicy::Off,
+            history: HistoryPolicy::AppendOnly,
+        };
+        assert!(policy.append_only_history_for_upstream(Some("official")));
+        assert!(!policy.append_only_history_for_upstream(Some("eswitch")));
+        assert!(!policy.append_only_history_for_upstream(None));
+
+        // Off never opts in, even on the official upstream.
+        let off = CachePolicy {
+            history: HistoryPolicy::Off,
+            ..policy.clone()
+        };
+        assert!(!off.append_only_history_for_upstream(Some("official")));
+        assert!(!off.append_only_history_for_upstream(None));
     }
 
     // --- Phase 2b.2: fail-closed session cache key contract (T16-T19) ---
@@ -1547,6 +1704,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         }
     }
@@ -1561,6 +1719,7 @@ mod tests {
                 upstream: None,
                 effort_enum: None,
                 replay: crate::cache::ReplayPolicy::Off,
+                history: crate::cache::HistoryPolicy::Off,
                 pinned_effort: None,
             })),
             CacheStatsMode::Legacy,
@@ -1602,6 +1761,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         assert_eq!(
@@ -1770,6 +1930,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         };
         assert_eq!(chat_usage_view(Some(&usage), Some(&off)), view);

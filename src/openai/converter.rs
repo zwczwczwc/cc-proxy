@@ -509,6 +509,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         }
     }

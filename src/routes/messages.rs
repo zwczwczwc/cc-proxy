@@ -342,6 +342,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
@@ -374,6 +375,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
@@ -396,6 +398,7 @@ mod tests {
             upstream: Some("eswitch".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, false);
@@ -480,6 +483,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
@@ -506,6 +510,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);

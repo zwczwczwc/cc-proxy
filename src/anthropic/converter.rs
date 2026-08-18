@@ -104,6 +104,32 @@ pub(crate) fn convert_request_with_relocation(
     // behavior is preserved byte-for-byte.
     let assistant_replay = replay_full || include_reasoning;
 
+    // Phase 4c: policy-gated append-only stored-history preservation.
+    //
+    // The legacy chat encoder rewrites already-provided history on the wire:
+    // `cleanup_orphan_tool_calls` strips orphaned `tool_calls` from
+    // non-final assistant messages, `compact_tool_result` truncates
+    // oversized `tool_result` bodies, and the P1-3 dedup drops repeated
+    // results for the same `tool_call_id`. Each rewrite mutates a stored
+    // message and busts the upstream prefix cache from that message onwards.
+    // `append_only` opts an explicit `cache_policy.history = "append_only"`
+    // official-upstream route into preserving that history byte-for-byte
+    // (order, tool IDs, content bytes). The gate is resolved data-driven via
+    // `effective_upstream_binding` (never a provider-name string, G7), and
+    // it governs STORED-HISTORY PRESERVATION ONLY: assistant reasoning
+    // replay (`replay_full`, Phase 4b) and the current request's own output
+    // control (`thinking.type` / `reasoning_effort`) are never touched by it.
+    let append_only = config
+        .model_profile(&upstream_model)
+        .and_then(|p| {
+            let binding = config.effective_upstream_binding(&p.provider);
+            config
+                .provider_config(&p.provider)
+                .and_then(|pc| pc.cache_policy.as_ref())
+                .map(|cp| cp.append_only_history_for_upstream(binding))
+        })
+        .unwrap_or(false);
+
     // Build OpenAI messages
     // Feature flag: relocate volatile env blocks from system prefix to last user turn
     // to stabilise KV cache prefix across turns.
@@ -131,8 +157,12 @@ pub(crate) fn convert_request_with_relocation(
     } else {
         (req.system.clone(), req.messages.clone())
     };
-    let messages =
-        build_chat_messages_with_reasoning(system.as_ref(), &messages_ref, assistant_replay);
+    let messages = build_chat_messages_with_reasoning(
+        system.as_ref(),
+        &messages_ref,
+        assistant_replay,
+        append_only,
+    );
 
     let stream = req.stream.unwrap_or(false);
 
@@ -1338,6 +1368,7 @@ mod tests {
             upstream: Some("official".to_string()),
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
@@ -1480,6 +1511,7 @@ mod tests {
             upstream: None,
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
@@ -1537,6 +1569,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: pin.map(|s| s.to_string()),
             prompt_cache_key_enabled: false,
         });
@@ -1673,6 +1706,7 @@ mod tests {
                 "max".to_string(),
             ]),
             replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
             pinned_effort: Some("high".to_string()),
             prompt_cache_key_enabled: false,
         });
@@ -1780,6 +1814,7 @@ mod tests {
             pinned_effort: None,
             prompt_cache_key_enabled: false,
             replay,
+            history: crate::cache::HistoryPolicy::Off,
         });
         config
     }
@@ -1981,6 +2016,7 @@ mod tests {
             pinned_effort: None,
             prompt_cache_key_enabled: false,
             replay: crate::cache::ReplayPolicy::FullAssistant,
+            history: crate::cache::HistoryPolicy::Off,
         });
         let req = kimi_history_req(
             Some(thinking_disabled()),
@@ -2054,6 +2090,225 @@ mod tests {
             user_id: Some("user-42".to_string()),
         });
         let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4c: policy-gated append-only stored-history preservation ---
+    //
+    // With `cache_policy.history = "append_only"` + the canonical official
+    // upstream (data-driven, G7), the chat encoder must never rewrite
+    // already-provided history: orphan tool_calls are not cleaned up,
+    // oversized tool_result bodies are not compacted, repeated results are
+    // not deduplicated. Off (default) or a non-official binding keeps the
+    // legacy rewrites byte-for-byte. The policy governs STORED-HISTORY
+    // preservation only — reasoning replay and current-request output
+    // control are untouched.
+
+    /// Config with the canonical `moonshot` provider bound to the official
+    /// upstream and declaring the given history policy.
+    fn kimi_history_policy_config(history: crate::cache::HistoryPolicy) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay: crate::cache::ReplayPolicy::Off,
+            history,
+        });
+        config
+    }
+
+    /// kimi-k3 request whose stored history exercises every legacy rewrite:
+    /// an orphan tool-call assistant turn (no matching result), an oversized
+    /// tool_result body, and a repeated result for the same tool_call_id.
+    fn kimi_append_only_req() -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        let big = "y".repeat(12000);
+        req.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolUse {
+                    id: "toolu_orphan".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_big".to_string(),
+                        content: crate::anthropic::types::ToolResultContent::Text(big.clone()),
+                        is_error: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_big".to_string(),
+                        content: crate::anthropic::types::ToolResultContent::Text(big),
+                        is_error: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("done".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Text("final".to_string()),
+            },
+        ];
+        req
+    }
+
+    #[test]
+    fn append_only_history_preserves_stored_history_on_official() {
+        // T core: with `history = append_only` on the official binding, the
+        // stored history is preserved byte-for-byte — orphan tool_calls are
+        // kept, oversized tool_result bodies are NOT compacted, repeated
+        // results are NOT deduplicated.
+        let config = kimi_history_policy_config(crate::cache::HistoryPolicy::AppendOnly);
+        let result =
+            convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
+
+        // Repeated oversized result preserved in full (both occurrences).
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let big = "y".repeat(12000);
+        assert_eq!(tools.len(), 2, "append-only: repeated results preserved");
+        assert_eq!(tools[0]["tool_call_id"], "toolu_big");
+        assert_eq!(tools[0]["content"].as_str().unwrap(), big);
+        assert_eq!(tools[1]["tool_call_id"], "toolu_big");
+        assert_eq!(tools[1]["content"].as_str().unwrap(), big);
+
+        // Orphan tool-call assistant preserved.
+        let asst = result
+            .messages
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("append-only: orphan assistant with tool_calls preserved");
+        assert_eq!(asst["tool_calls"][0]["id"], "toolu_orphan");
+
+        // History-only: current-request output control untouched.
+        assert!(result.thinking.is_none());
+        assert_eq!(result.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn append_only_history_off_keeps_legacy_rewrites() {
+        // Golden policy-off baseline: `history = off` keeps the legacy chat
+        // encoder byte-for-byte — oversized compaction, duplicate dedup and
+        // orphan cleanup all still fire on the official Kimi upstream.
+        let config = kimi_history_policy_config(crate::cache::HistoryPolicy::Off);
+        let result =
+            convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
+
+        // Duplicate result for toolu_big is deduplicated to a single tool msg
+        // and the oversized body is compacted.
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 1, "legacy: duplicate result deduplicated");
+        assert!(
+            tools[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("bytes truncated"),
+            "legacy: oversized result compacted"
+        );
+
+        // Orphan tool-call assistant is cleaned up.
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m["role"] == "assistant" && m.get("tool_calls").is_some()),
+            "legacy: orphan tool-call assistant cleaned up"
+        );
+    }
+
+    #[test]
+    fn append_only_history_without_official_binding_stays_legacy() {
+        // Fail-closed: `history = append_only` WITHOUT the canonical
+        // "official" upstream binding leaves the legacy rewrites intact
+        // (data-driven gate, G7 — never a provider-name string).
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::AppendOnly,
+        });
+        let result =
+            convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(
+            tools.len(),
+            1,
+            "no official binding => legacy dedup/compaction retained"
+        );
+        assert!(tools[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("bytes truncated"));
+    }
+
+    #[test]
+    fn append_only_history_does_not_apply_to_non_moonshot_providers() {
+        // Non-moonshot providers are untouched: a deepseek request (no
+        // policy, no official binding) keeps legacy cleanup/compaction/dedup.
+        let config = test_config();
+        let mut req = kimi_append_only_req();
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 1, "deepseek legacy dedup retained");
+        assert!(tools[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("bytes truncated"));
+    }
+
+    #[test]
+    fn append_only_history_does_not_touch_effort_replay_or_key() {
+        // Phase 4c is history-only: no reasoning_effort/thinking changes, no
+        // replay change (replay stays Off), and no prompt_cache_key injection
+        // (no P3-C opt-in), even with a stable metadata.user_id present.
+        let config = kimi_history_policy_config(crate::cache::HistoryPolicy::AppendOnly);
+        let mut req = kimi_append_only_req();
+        req.metadata = Some(crate::anthropic::types::Metadata {
+            user_id: Some("user-42".to_string()),
+        });
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert!(result.thinking.is_none());
         assert_eq!(result.prompt_cache_key, None);
         let body = serde_json::to_value(&result).unwrap();
         assert!(body.get("prompt_cache_key").is_none());
