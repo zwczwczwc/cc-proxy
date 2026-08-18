@@ -113,6 +113,24 @@ pub struct CachePolicy {
     /// explicitly declares this capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_enum: Option<Vec<String>>,
+    /// Explicit, stateless reasoning-effort pin (Phase 4a, T13).
+    ///
+    /// When set to a legal wire effort (the official Kimi set is exactly
+    /// `{low, high, max}` — validated against [`Self::effort_enum`]), the
+    /// converter's effort path uses this value instead of recomputing effort
+    /// from the per-request `thinking.budget_tokens`, so a session's
+    /// `reasoning_effort` never flips as the client varies its thinking
+    /// budget between requests.
+    ///
+    /// This is a **static, stateless pin** declared in config: it does NOT
+    /// "capture the first request's effort and remember it per session".
+    /// True per-session derivation would require implicit server-side session
+    /// state, which this codebase deliberately avoids; the pin is explicit in
+    /// config instead, so it is deterministic across calls, restarts and
+    /// sessions by construction. Default `None` (no pin) keeps the existing
+    /// dynamic per-request effort derivation byte-for-byte.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pinned_effort: Option<String>,
     /// Whether this policy opts into injecting a deterministic session
     /// `prompt_cache_key` on the outbound Chat wire (Phase 3 P3-C).
     ///
@@ -142,6 +160,25 @@ impl CachePolicy {
         !matches!(self.usage, UsagePolicy::Off)
     }
 
+    /// The reasoning effort pinned by this policy, gated on the canonical
+    /// official upstream (Phase 4a, T13).
+    ///
+    /// Returns `Some(effort)` only when BOTH hold: this policy declares an
+    /// explicit `pinned_effort` AND the provider's effective upstream binding
+    /// resolves to `"official"` (Kimi For Coding). Any other route — no pin,
+    /// or a provider routed through the default eswitch upstream — returns
+    /// `None` and keeps the dynamic per-request effort derivation. The
+    /// binding must be resolved data-driven (never a provider-name string,
+    /// G7); the converter calls this with
+    /// [`crate::config::Config::effective_upstream_binding`].
+    pub fn pinned_effort_for_upstream(&self, effective_upstream: Option<&str>) -> Option<&str> {
+        if effective_upstream == Some("official") {
+            self.pinned_effort.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Fail-fast startup validation of a provider's `effort_map` outputs
     /// against this policy's declared `effort_enum` (Phase 3 P3-B).
     ///
@@ -156,6 +193,19 @@ impl CachePolicy {
     /// effort value.
     pub fn validate_effort_enum(&self, provider: &str, effort_map: &HashMap<String, String>) {
         let Some(allowlist) = &self.effort_enum else {
+            // Fail-closed: a pinned effort is a wire-effort promise and must
+            // be validated against an explicit legal set — it can never be
+            // declared without one (Phase 4a, T12/T13). This is a startup
+            // error, never a silent skip.
+            if self.pinned_effort.is_some() {
+                panic!(
+                    "Provider '{}' declares cache_policy.pinned_effort but no \
+                     cache_policy.effort_enum; a pinned effort must be \
+                     validated against an explicit legal wire set \
+                     (Kimi official: low/high/max).",
+                    provider
+                );
+            }
             return; // not opted in — legacy effort maps stay valid
         };
         for (input, output) in effort_map {
@@ -166,6 +216,19 @@ impl CachePolicy {
                      wire effort set. Fix the effort_map output or drop the \
                      strict enum.",
                     provider, allowlist, input, output
+                );
+            }
+        }
+        // Phase 4a: the pinned effort itself must be a member of the declared
+        // legal set. An invalid pin is a hard config error — never silently
+        // normalized, never coerced to a different effort on the wire.
+        if let Some(pinned) = &self.pinned_effort {
+            if !allowlist.contains(pinned) {
+                panic!(
+                    "Provider '{}' cache_policy.pinned_effort '{}' is not in \
+                     the declared effort_enum {:?}. Legal wire efforts for \
+                     this provider are exactly the declared set.",
+                    provider, pinned, allowlist
                 );
             }
         }
@@ -875,6 +938,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         };
         assert!(enabled.cache_usage_enabled());
 
@@ -883,6 +947,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
         };
         assert!(
             !binding_only.cache_usage_enabled(),
@@ -917,6 +982,7 @@ mod tests {
             usage: UsagePolicy::Off,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
             prompt_cache_key_enabled: true,
         };
         let json = serde_json::to_string(&on).unwrap();
@@ -936,6 +1002,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: CachePolicy = serde_json::from_str(&json).unwrap();
@@ -966,6 +1033,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         };
         let mut legacy = HashMap::new();
         legacy.insert("medium".to_string(), "medium".to_string());
@@ -987,6 +1055,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            pinned_effort: None,
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
     }
@@ -1006,6 +1075,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            pinned_effort: None,
         };
         let mut map = kimi_effort_map();
         map.insert("medium".to_string(), "medium".to_string());
@@ -1027,10 +1097,125 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            pinned_effort: None,
         };
         let mut map = kimi_effort_map();
         map.insert("xhigh".to_string(), "xhigh".to_string());
         policy.validate_effort_enum("moonshot", &map);
+    }
+
+    // --- Phase 4a: deterministic Kimi reasoning-effort pin (T13) ---
+
+    #[test]
+    fn pinned_effort_for_upstream_gates_on_official_binding() {
+        // A pin only applies when BOTH an explicit pinned_effort is declared
+        // AND the effective upstream binding is the canonical "official"
+        // (Kimi For Coding) upstream. Everything else is `None` — the dynamic
+        // per-request derivation is preserved.
+        let policy = CachePolicy {
+            pinned_effort: Some("high".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            policy.pinned_effort_for_upstream(Some("official")),
+            Some("high")
+        );
+        assert_eq!(policy.pinned_effort_for_upstream(Some("eswitch")), None);
+        assert_eq!(policy.pinned_effort_for_upstream(None), None);
+
+        // No pin declared => never returns one, even on the official upstream.
+        let no_pin = CachePolicy::default();
+        assert_eq!(no_pin.pinned_effort_for_upstream(Some("official")), None);
+    }
+
+    #[test]
+    fn pinned_effort_serde_off_by_default_and_roundtrips_when_set() {
+        // T13 config surface: absent -> None (no pin, legacy dynamic effort).
+        let absent: CachePolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.pinned_effort, None);
+
+        let pinned = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: Some("high".to_string()),
+        };
+        let json = serde_json::to_string(&pinned).unwrap();
+        assert!(
+            json.contains(r#""pinned_effort":"high""#),
+            "a set pin must serialize: {json}"
+        );
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, pinned);
+
+        // None is omitted from the wire config (fail-closed default).
+        let none = CachePolicy {
+            pinned_effort: None,
+            ..pinned.clone()
+        };
+        let json_none = serde_json::to_string(&none).unwrap();
+        assert!(!json_none.contains("pinned_effort"));
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn pinned_effort_without_declared_enum_fails_fast() {
+        // Fail-closed: a pin is a wire-effort promise and must be validated
+        // against an explicit legal set — it can never be declared without
+        // one (T12: config validation is never silent).
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            pinned_effort: Some("high".to_string()),
+        };
+        policy.validate_effort_enum("moonshot", &kimi_effort_map());
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn pinned_effort_rejects_value_outside_declared_enum() {
+        // `medium` is not in the official Kimi set {low,high,max}: an invalid
+        // pin must fail fast at startup, never be silently normalized or
+        // coerced to a different effort on the wire.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: Some("medium".to_string()),
+        };
+        policy.validate_effort_enum("moonshot", &kimi_effort_map());
+    }
+
+    #[test]
+    fn pinned_effort_legal_value_passes_validation() {
+        // Every legal Kimi wire effort validates cleanly when the enum is
+        // declared alongside the pin.
+        for pin in ["low", "high", "max"] {
+            let policy = CachePolicy {
+                usage: UsagePolicy::Off,
+                prompt_cache_key_enabled: false,
+                upstream: Some("official".to_string()),
+                effort_enum: Some(vec![
+                    "low".to_string(),
+                    "high".to_string(),
+                    "max".to_string(),
+                ]),
+                pinned_effort: Some(pin.to_string()),
+            };
+            policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
+        }
     }
 
     // --- Phase 2b.2: fail-closed session cache key contract (T16-T19) ---
@@ -1135,6 +1320,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         }
     }
 
@@ -1147,6 +1333,7 @@ mod tests {
                 prompt_cache_key_enabled: false,
                 upstream: None,
                 effort_enum: None,
+                pinned_effort: None,
             })),
             CacheStatsMode::Legacy,
             "explicit usage:off is still legacy (never activates)"
@@ -1186,6 +1373,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         };
         assert_eq!(
             responses_usage_view(Some(&usage), Some(&off)),
@@ -1352,6 +1540,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         };
         assert_eq!(chat_usage_view(Some(&usage), Some(&off)), view);
     }

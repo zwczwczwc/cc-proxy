@@ -341,6 +341,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
         assert_routes_to("deepseek-v4-pro", &config, false);
@@ -371,6 +372,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
     }
@@ -391,6 +393,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("eswitch".to_string()),
             effort_enum: None,
+            pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, false);
     }
@@ -473,6 +476,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
         assert_routes_to("deepseek-v4-pro", &config, false);
@@ -497,6 +501,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
     }

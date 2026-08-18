@@ -148,10 +148,38 @@ pub(crate) fn convert_request_with_relocation(
     let is_gpt_provider = profile.map(|p| p.provider == "gpt").unwrap_or(false);
     let has_tools = openai_req.tools.is_some();
 
+    // Phase 4a (T13): explicit, stateless Kimi reasoning-effort pin.
+    //
+    // `CachePolicy.pinned_effort` (default `None`) opts a provider into a
+    // fixed wire effort. When declared AND the provider's effective upstream
+    // binding resolves to the canonical `"official"` (Kimi For Coding)
+    // upstream, the effort applied below is the pinned value instead of the
+    // per-request `thinking.budget_tokens`-derived default — so a session's
+    // reasoning_effort never flips as the client varies its thinking budget
+    // between requests.
+    //
+    // The pin is a static config value, NOT a value captured from "the first
+    // request" and remembered: true per-session derivation would require
+    // implicit server-side session state, which this codebase deliberately
+    // avoids (documented on `CachePolicy::pinned_effort`). Because the pin is
+    // explicit in config it is deterministic across calls, restarts and
+    // sessions by construction, and the dynamic path stays byte-for-byte
+    // intact for every non-opt-in route (fail-closed). The gate is resolved
+    // data-driven via `effective_upstream_binding` — never a provider-name
+    // string (G7).
+    let pinned_effort = profile.and_then(|p| {
+        let binding = config.effective_upstream_binding(&p.provider);
+        config
+            .provider_config(&p.provider)
+            .and_then(|pc| pc.cache_policy.as_ref())
+            .and_then(|cp| cp.pinned_effort_for_upstream(binding))
+    });
+
     if let Some(thinking) = &req.thinking {
         if thinking.is_enabled() {
-            // Default all thinking-enabled requests to xhigh effort.
-            let effort = "xhigh";
+            // Default all thinking-enabled requests to xhigh effort, unless an
+            // explicit Phase 4a pin overrides it (Kimi official only).
+            let effort = pinned_effort.unwrap_or("xhigh");
             let effort = if is_gpt_provider && has_tools {
                 "off"
             } else {
@@ -165,7 +193,7 @@ pub(crate) fn convert_request_with_relocation(
         let effort = if is_gpt_provider && has_tools {
             "off"
         } else {
-            "xhigh"
+            pinned_effort.unwrap_or("xhigh")
         };
         apply_effort_direct(&mut openai_req, effort, config);
     }
@@ -1278,6 +1306,7 @@ mod tests {
             usage: crate::cache::UsagePolicy::Off,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
         config
@@ -1418,6 +1447,7 @@ mod tests {
             usage: crate::cache::UsagePolicy::Off,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
         let result = convert_request(&kimi_req_with_metadata(Some("user-42")), &config).unwrap();
@@ -1450,6 +1480,203 @@ mod tests {
         let mut req = kimi_req_with_metadata(Some("user-42"));
         req.model = "deepseek-v4-pro".to_string();
         let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4a: deterministic Kimi reasoning-effort pin (T13) ---
+
+    /// Config with the canonical `moonshot` provider bound to the official
+    /// upstream, declaring an explicit Kimi effort enum and an optional pin.
+    fn kimi_pinned_config(pin: Option<&str>) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: pin.map(|s| s.to_string()),
+            prompt_cache_key_enabled: false,
+        });
+        config
+    }
+
+    /// kimi-k3 request with `thinking.enabled` at a given budget; `None`
+    /// budget means no thinking config at all (the common Claude path).
+    fn kimi_req_with_thinking_budget(budget: Option<u32>) -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.thinking = budget.map(|b| ThinkingConfig::Enabled {
+            config_type: "enabled".to_string(),
+            budget_tokens: Some(b),
+            display: None,
+        });
+        req
+    }
+
+    #[test]
+    fn pinned_effort_low_is_stable_across_thinking_budgets() {
+        // T13: a pinned `low` effort must be byte-stable across a wide range
+        // of thinking budgets (jitter) — the wire effort never flips.
+        let config = kimi_pinned_config(Some("low"));
+        for budget in [0, 512, 4095, 4096, 16000, 32768] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("low"),
+                "pinned low must not flip with budget={budget}"
+            );
+            assert!(result.thinking.is_none(), "Kimi K3 has no thinking.type");
+        }
+        // No thinking config at all stays pinned too.
+        let result =
+            convert_request_with_relocation(&kimi_req_with_thinking_budget(None), &config, false)
+                .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn pinned_effort_high_is_stable_across_thinking_budgets() {
+        let config = kimi_pinned_config(Some("high"));
+        for budget in [0, 512, 4095, 16000, 32768] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("high"),
+                "pinned high must not flip with budget={budget}"
+            );
+        }
+        let result =
+            convert_request_with_relocation(&kimi_req_with_thinking_budget(None), &config, false)
+                .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn pinned_effort_max_is_stable_across_thinking_budgets() {
+        let config = kimi_pinned_config(Some("max"));
+        for budget in [0, 512, 4095, 16000, 32768] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("max"),
+                "pinned max must not flip with budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_pinned_effort_keeps_dynamic_derivation() {
+        // Fail-closed: official binding WITHOUT an explicit pin leaves the
+        // existing dynamic derivation byte-for-byte intact (thinking-enabled
+        // kimi → xhigh → max, exactly as before Phase 4a).
+        let config = kimi_pinned_config(None);
+        for budget in [512, 16000] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("max"),
+                "no pin => dynamic derivation preserved for budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn optout_policy_preserves_dynamic_derivation() {
+        // An explicitly present policy that does NOT declare a pin (the P3-C
+        // key opt-in shape) keeps dynamic effort — a pin is never implied by
+        // the presence of a cache_policy block.
+        let config = kimi_optin_config(); // prompt_cache_key_enabled, no pin
+        let result = convert_request_with_relocation(
+            &kimi_req_with_thinking_budget(Some(16000)),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn pinned_effort_without_official_binding_does_not_pin() {
+        // Fail-closed: a pin declared without the canonical "official"
+        // upstream binding is not applied. The gate is data-driven (no
+        // provider-name string, G7).
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: Some("high".to_string()),
+            prompt_cache_key_enabled: false,
+        });
+        let result = convert_request_with_relocation(
+            &kimi_req_with_thinking_budget(Some(16000)),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.reasoning_effort.as_deref(),
+            Some("max"),
+            "no official binding => pin must not apply"
+        );
+    }
+
+    #[test]
+    fn pinned_effort_does_not_apply_to_non_moonshot_providers() {
+        // Non-moonshot providers (no policy, no official binding) are
+        // untouched: a deepseek request still derives effort dynamically.
+        let config = test_config();
+        let mut req = kimi_req_with_thinking_budget(Some(16000));
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn pinned_effort_does_not_change_prompt_cache_key_behavior() {
+        // Phase 4a is effort-only: enabling a pin WITHOUT the P3-C key opt-in
+        // must not inject a prompt_cache_key (no key changes), even with a
+        // stable metadata.user_id present.
+        let config = kimi_pinned_config(Some("high"));
+        let result = convert_request_with_relocation(
+            &kimi_req_with_metadata(Some("user-42")),
+            &config,
+            false,
+        )
+        .unwrap();
         assert_eq!(result.prompt_cache_key, None);
         let body = serde_json::to_value(&result).unwrap();
         assert!(body.get("prompt_cache_key").is_none());

@@ -993,6 +993,7 @@ max = "max"
                     prompt_cache_key_enabled: false,
                     upstream: Some("not-a-real-upstream".to_string()),
                     effort_enum: None,
+                    pinned_effort: None,
                 }),
             },
         );
@@ -1075,6 +1076,7 @@ max = "max"
                     prompt_cache_key_enabled: false,
                     upstream: Some("official".to_string()),
                     effort_enum: None,
+                    pinned_effort: None,
                 }),
             },
         );
@@ -1370,6 +1372,7 @@ max = "max"
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: Some(kimi_effort_enum()),
+            pinned_effort: None,
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
         config.validate(); // must not panic
@@ -1387,6 +1390,7 @@ max = "max"
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: Some(kimi_effort_enum()),
+            pinned_effort: None,
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[("medium", "medium")]));
         config.validate(); // should panic on the illegal medium output
@@ -1402,6 +1406,7 @@ max = "max"
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: Some(kimi_effort_enum()),
+            pinned_effort: None,
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[("xhigh", "xhigh")]));
         config.validate(); // should panic on the illegal xhigh output
@@ -1417,6 +1422,79 @@ max = "max"
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
+        };
+        let config = moonshot_config_with_policy(
+            policy,
+            effort_map_with(&[("medium", "medium"), ("xhigh", "max"), ("none", "none")]),
+        );
+        config.validate(); // must not panic
+    }
+
+    // --- Phase 4a: pinned_effort config validation (T12/T13) ---
+
+    #[test]
+    fn validate_accepts_legal_pinned_effort() {
+        // A pin inside the declared Kimi enum {low,high,max} with a matching
+        // effort_map validates cleanly at startup (opt-in only).
+        for pin in ["low", "high", "max"] {
+            let policy = CachePolicy {
+                usage: UsagePolicy::Off,
+                prompt_cache_key_enabled: false,
+                upstream: Some("official".to_string()),
+                effort_enum: Some(kimi_effort_enum()),
+                pinned_effort: Some(pin.to_string()),
+            };
+            let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
+            config.validate(); // must not panic
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn validate_rejects_pinned_effort_without_declared_enum() {
+        // Fail-closed: a pin is a wire-effort promise and must be validated
+        // against an explicit legal set — it can never be declared without
+        // one (T12: config validation is never silent).
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            pinned_effort: Some("high".to_string()),
+        };
+        let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
+        config.validate(); // should panic on the un-validatable pin
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn validate_rejects_pinned_effort_outside_declared_enum() {
+        // `medium` is not in the official Kimi set {low,high,max}: an invalid
+        // pin must fail fast at startup, never be silently normalized or
+        // coerced to a different effort on the wire.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(kimi_effort_enum()),
+            pinned_effort: Some("medium".to_string()),
+        };
+        let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
+        config.validate(); // should panic on the illegal pinned effort
+    }
+
+    #[test]
+    fn validate_keeps_legacy_configs_valid_without_pin() {
+        // No pinned_effort (the state of every current config and the
+        // default-off `test_config()` fixtures): validation is unchanged and
+        // legacy effort maps with medium/xhigh/none outputs stay valid.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: None,
+            effort_enum: None,
+            pinned_effort: None,
         };
         let config = moonshot_config_with_policy(
             policy,

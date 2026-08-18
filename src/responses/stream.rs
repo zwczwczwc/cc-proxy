@@ -1306,6 +1306,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         };
         // Consistent data: miss = input - read - creation.
         let raw = crate::cache::responses_usage_view_from_buckets(

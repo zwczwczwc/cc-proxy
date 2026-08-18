@@ -404,6 +404,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            pinned_effort: None,
         };
         let converted = convert_response(&response, "fallback", "msg-1", Some(&policy)).unwrap();
         assert_eq!(converted.usage.cache_read_input_tokens, Some(80));
