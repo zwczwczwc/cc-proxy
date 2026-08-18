@@ -1,6 +1,7 @@
 mod anthropic;
 mod client;
 mod config;
+mod conversation;
 mod openai;
 mod reasoning;
 mod responses;

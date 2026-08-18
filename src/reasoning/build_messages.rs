@@ -1,4 +1,5 @@
 use crate::anthropic::types::{ContentBlock, ContentValue, Message, SystemPrompt};
+use crate::conversation::AssistantPart;
 use serde_json::{json, Value};
 
 /// Compute a hash key for tool_result deduplication (P1-3).
@@ -46,6 +47,17 @@ pub fn build_chat_messages_with_reasoning(
     messages: &[Message],
     include_reasoning: bool,
 ) -> Vec<Value> {
+    let conversation = crate::conversation::build_conversation(system, messages, Vec::new());
+    render_chat_messages(&conversation, include_reasoning)
+}
+
+/// Render the lean ConversationIR to OpenAI chat wire messages.
+/// Chat-specific safety nets (tool_result dedup/compaction, orphan tool_call
+/// cleanup, reasoning placeholder) stay here on the wire form.
+fn render_chat_messages(
+    conversation: &crate::conversation::Conversation,
+    include_reasoning: bool,
+) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
 
     // P1-3: tool_result dedup tracking
@@ -53,7 +65,7 @@ pub fn build_chat_messages_with_reasoning(
     let mut seen_results: HashMap<String, String> = HashMap::new(); // tool_call_id -> content_hash
 
     // 1. Handle system prompt
-    if let Some(sys) = system {
+    if let Some(sys) = &conversation.system {
         let sys_text = system_prompt_to_text(sys);
         if !sys_text.is_empty() {
             result.push(json!({
@@ -63,13 +75,13 @@ pub fn build_chat_messages_with_reasoning(
         }
     }
 
-    // 2. Convert each message
-    for msg in messages {
-        let role = &msg.role;
-        match role.as_str() {
-            "user" => {
+    // 2. Convert each turn
+    use crate::conversation::Turn;
+    for turn in &conversation.turns {
+        match turn {
+            Turn::User { content } => {
                 // Check if this is actually a tool_result message
-                if let ContentValue::Blocks(blocks) = &msg.content {
+                if let ContentValue::Blocks(blocks) = content {
                     let has_tool_results = blocks
                         .iter()
                         .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
@@ -110,19 +122,19 @@ pub fn build_chat_messages_with_reasoning(
                         continue;
                     }
                 }
-                let openai_msg = convert_user_message(&msg.content);
+                let openai_msg = convert_user_message(content);
                 result.push(json!({
                     "role": "user",
                     "content": openai_msg,
                 }));
             }
-            "assistant" => {
-                let openai_msg = convert_assistant_message(&msg.content, include_reasoning);
+            Turn::Assistant { parts } => {
+                let openai_msg = convert_assistant_parts(parts, include_reasoning);
                 result.push(openai_msg);
             }
-            _ => {
+            Turn::Unknown { role, content } => {
                 // Unknown role, keep as-is
-                let content = content_value_to_json(&msg.content);
+                let content = content_value_to_json(content);
                 result.push(json!({
                     "role": role,
                     "content": content,
@@ -256,42 +268,20 @@ fn tool_result_to_text(content: &crate::anthropic::types::ToolResultContent) -> 
     }
 }
 
-fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) -> Value {
-    let blocks = match content {
-        ContentValue::Text(text) => {
-            return json!({
-                "role": "assistant",
-                "content": text,
-            });
-        }
-        ContentValue::Null => {
-            return json!({
-                "role": "assistant",
-                "content": null,
-            });
-        }
-        ContentValue::Blocks(b) => b,
-    };
-
+fn convert_assistant_parts(parts: &[AssistantPart], include_reasoning: bool) -> Value {
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
 
-    for block in blocks {
-        match block {
-            ContentBlock::Thinking {
-                thinking,
-                signature: _,
-            } => {
-                thinking_parts.push(thinking.clone());
+    for part in parts {
+        match part {
+            AssistantPart::Reasoning(text) => {
+                thinking_parts.push(text.clone());
             }
-            ContentBlock::RedactedThinking { data: _ } => {
-                thinking_parts.push("(redacted thinking)".to_string());
-            }
-            ContentBlock::Text { text } => {
+            AssistantPart::Text(text) => {
                 text_parts.push(text.clone());
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            AssistantPart::ToolCall { id, name, input } => {
                 tool_calls.push(json!({
                     "id": id,
                     "type": "function",
@@ -301,7 +291,9 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
                     }
                 }));
             }
-            _ => {}
+            // ToolResult / Image inside an assistant message are dropped by the
+            // Chat encoder (matches the pre-IR `_ => {}` behavior).
+            AssistantPart::ToolResult { .. } | AssistantPart::Image { .. } => {}
         }
     }
 

@@ -130,7 +130,7 @@ pub(crate) fn convert_request_with_relocation(
     // Convert tools (sorted by name for KV cache prefix stability)
     if let Some(tools) = &req.tools {
         let mut openai_tools: Vec<OpenAiTool> = tools.iter().map(convert_tool).collect();
-        openai_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        crate::conversation::sort_by_name(&mut openai_tools, |t| &t.function.name);
         openai_req.tools = Some(openai_tools);
     }
 

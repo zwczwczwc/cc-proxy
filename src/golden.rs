@@ -15,13 +15,13 @@
 //! under `tests/` as a Rust test target.
 //!
 //! Modes:
-//!   * default         — verify: re-encode every fixture and compare the
-//!                       resulting wire bytes (sha256) + body against the
-//!                       committed snapshots. Byte mismatch ⇒ NO-GO.
+//!   * default — verify: re-encode every fixture and compare the
+//!     resulting wire bytes (sha256) + body against the
+//!     committed snapshots. Byte mismatch ⇒ NO-GO.
 //!   * GOLDEN_CAPTURE=1 — (re)capture: write the snapshots from the *current*
-//!                       encoder. Must be run *before* the ConversationIR
-//!                       refactor so the committed snapshots reflect the old
-//!                       encoder (zero-behavior baseline).
+//!     encoder. Must be run *before* the ConversationIR
+//!     refactor so the committed snapshots reflect the old
+//!     encoder (zero-behavior baseline).
 
 use crate::anthropic::converter::convert_request_with_relocation as chat_convert;
 use crate::anthropic::types::MessagesRequest;
