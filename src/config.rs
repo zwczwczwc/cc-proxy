@@ -335,6 +335,18 @@ impl Config {
                 }
             }
         }
+
+        // 8. cache_policy.effort_enum, when declared, must accept every
+        //    effort_map output value (P3-B fail-fast, no silent normalization).
+        //    Only opt-in providers are validated: `None` — the default and the
+        //    state of every current config — keeps legacy maps with
+        //    `medium`/`xhigh`/`none` outputs valid unchanged, so non-opt-in
+        //    and default-off profiles stay byte-for-byte backward compatible.
+        for (name, provider) in &self.providers {
+            if let Some(policy) = &provider.cache_policy {
+                policy.validate_effort_enum(name, &provider.effort_map);
+            }
+        }
     }
 
     /// Load model config from file with priority:
@@ -920,6 +932,7 @@ max = "max"
                 cache_policy: Some(CachePolicy {
                     usage: UsagePolicy::TopLevelCachedTokens,
                     upstream: Some("not-a-real-upstream".to_string()),
+                    effort_enum: None,
                 }),
             },
         );
@@ -1000,6 +1013,7 @@ max = "max"
                 cache_policy: Some(CachePolicy {
                     usage: UsagePolicy::Off,
                     upstream: Some("official".to_string()),
+                    effort_enum: None,
                 }),
             },
         );
@@ -1159,5 +1173,131 @@ max = "max"
             canonical.effort_map, via_alias.effort_map,
             "alias must resolve to the canonical provider's effort_map"
         );
+    }
+
+    // --- Phase 3 (P3-B): cache_policy.effort_enum validation (C12) ---
+
+    /// Build a Config with a single canonical `moonshot` provider whose
+    /// `cache_policy` and `effort_map` are supplied by the caller, wired to a
+    /// `kimi-k3` profile, and fully validated.
+    fn moonshot_config_with_policy(
+        policy: CachePolicy,
+        effort_map: HashMap<String, String>,
+    ) -> Config {
+        let mut providers = HashMap::new();
+        providers.insert(
+            "moonshot".to_string(),
+            ProviderConfig {
+                reasoning_field: "reasoning".to_string(),
+                reasoning_field_alt: vec![],
+                thinking_param: None,
+                thinking_type_enabled: None,
+                thinking_type_disabled: None,
+                disable_thinking: true,
+                effort_param: "reasoning_effort".to_string(),
+                effort_map,
+                responses_reasoning_summary: None,
+                cache_policy: Some(policy),
+            },
+        );
+        let model_profiles = vec![ModelProfile {
+            name: "kimi-k3".to_string(),
+            provider: "moonshot".to_string(),
+            reasoning_enabled: true,
+            reasoning_replay: true,
+            toolcall_requires_reasoning: false,
+            aliases: vec![],
+            wire_api: WireApi::ChatCompletions,
+        }];
+        let mut config = Config {
+            listen_addr: "0.0.0.0:11435".to_string(),
+            eswitch_url: "http://127.0.0.1:11434".to_string(),
+            moonshot_official_url: String::new(),
+            moonshot_official_api_key: String::new(),
+            api_key: "test".to_string(),
+            log_level: "info".to_string(),
+            model_mapping: HashMap::new(),
+            default_model: "kimi-k3".to_string(),
+            model_profiles,
+            providers,
+            profile_by_name: HashMap::new(),
+        };
+        config.build_profile_index();
+        config
+    }
+
+    fn effort_map_with(extra: &[(&str, &str)]) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("low".to_string(), "low".to_string());
+        m.insert("high".to_string(), "high".to_string());
+        m.insert("max".to_string(), "max".to_string());
+        for (k, v) in extra {
+            m.insert((*k).to_string(), (*v).to_string());
+        }
+        m
+    }
+
+    fn kimi_effort_enum() -> Vec<String> {
+        vec!["low".to_string(), "high".to_string(), "max".to_string()]
+    }
+
+    #[test]
+    fn validate_accepts_kimi_effort_enum_with_legal_outputs() {
+        // An explicit Kimi enum {low,high,max} whose effort_map outputs all
+        // stay inside the set validates cleanly at startup.
+        let policy = CachePolicy {
+            usage: UsagePolicy::TopLevelCachedTokens,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(kimi_effort_enum()),
+        };
+        let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
+        config.validate(); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn validate_rejects_effort_map_output_outside_declared_enum() {
+        // A `medium` output under the explicit Kimi enum is an illegal wire
+        // effort: validate() must fail fast at startup, never silently
+        // normalize. This is the P3-B opt-in gate (and the exact risk the
+        // current config.toml would hit if it ever declared effort_enum).
+        let policy = CachePolicy {
+            usage: UsagePolicy::TopLevelCachedTokens,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(kimi_effort_enum()),
+        };
+        let config = moonshot_config_with_policy(policy, effort_map_with(&[("medium", "medium")]));
+        config.validate(); // should panic on the illegal medium output
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn validate_rejects_xhigh_output_under_explicit_enum() {
+        // The OSS `xhigh` acceptance is deliberately NOT copied: an xhigh
+        // output under the Kimi enum is illegal and fails fast.
+        let policy = CachePolicy {
+            usage: UsagePolicy::TopLevelCachedTokens,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(kimi_effort_enum()),
+        };
+        let config = moonshot_config_with_policy(policy, effort_map_with(&[("xhigh", "xhigh")]));
+        config.validate(); // should panic on the illegal xhigh output
+    }
+
+    #[test]
+    fn validate_keeps_legacy_effort_maps_valid_without_enum() {
+        // No explicit enum (None — the state of every current config): a
+        // policy-bound provider whose effort_map still emits medium/xhigh/none
+        // stays valid. Non-opt-in and default-off profiles are unchanged.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+        };
+        let config = moonshot_config_with_policy(
+            policy,
+            effort_map_with(&[("medium", "medium"), ("xhigh", "max"), ("none", "none")]),
+        );
+        config.validate(); // must not panic
     }
 }

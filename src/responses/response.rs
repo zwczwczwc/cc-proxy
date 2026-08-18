@@ -402,6 +402,7 @@ mod tests {
         let policy = crate::cache::CachePolicy {
             usage: crate::cache::UsagePolicy::TopLevelCachedTokens,
             upstream: None,
+            effort_enum: None,
         };
         let converted = convert_response(&response, "fallback", "msg-1", Some(&policy)).unwrap();
         assert_eq!(converted.usage.cache_read_input_tokens, Some(80));

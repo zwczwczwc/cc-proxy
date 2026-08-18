@@ -506,6 +506,7 @@ mod tests {
         CachePolicy {
             usage: crate::cache::UsagePolicy::TopLevelCachedTokens,
             upstream: None,
+            effort_enum: None,
         }
     }
 

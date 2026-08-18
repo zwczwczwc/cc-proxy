@@ -1304,6 +1304,7 @@ mod tests {
         let policy = crate::cache::CachePolicy {
             usage: crate::cache::UsagePolicy::TopLevelCachedTokens,
             upstream: None,
+            effort_enum: None,
         };
         // Consistent data: miss = input - read - creation.
         let raw = crate::cache::responses_usage_view_from_buckets(

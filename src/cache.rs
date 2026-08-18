@@ -38,6 +38,7 @@ use crate::openai::types::Usage as ChatUsage;
 use crate::responses::types::ResponsesUsage;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 
 /// Which upstream usage shape produced a `CacheStats`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -101,6 +102,17 @@ pub struct CachePolicy {
     /// default (eswitch) routing. Phase 3 canonicalizes provider names and
     /// replaces the `select_client` string match with this binding.
     pub upstream: Option<String>,
+    /// Optional strict legal-effort allowlist (Phase 3 P3-B).
+    ///
+    /// When declared, `validate_effort_enum()` fail-fasts at startup on any
+    /// `effort_map` output outside this set — a provider that opts in to a strict enum can
+    /// never silently emit an illegal effort value. The Kimi (Moonshot)
+    /// official set is strictly `{low, high, max}`. `None` (default) keeps
+    /// every legacy effort_map valid: DeepSeek/GLM/GPT maps (which include
+    /// `medium`/`xhigh`/`none` outputs) are untouched unless a provider
+    /// explicitly declares this capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_enum: Option<Vec<String>>,
 }
 
 impl CachePolicy {
@@ -110,6 +122,35 @@ impl CachePolicy {
     /// cache usage once its policy names a concrete usage source.
     pub fn cache_usage_enabled(&self) -> bool {
         !matches!(self.usage, UsagePolicy::Off)
+    }
+
+    /// Fail-fast startup validation of a provider's `effort_map` outputs
+    /// against this policy's declared `effort_enum` (Phase 3 P3-B).
+    ///
+    /// Only providers that explicitly opt in by declaring `effort_enum` are
+    /// checked: when `effort_enum == None` (the default, and the state of every
+    /// current config) all legacy `effort_map` outputs — including the
+    /// DeepSeek/GLM/GPT `medium`/`xhigh`/`none` entries — stay valid, so
+    /// default-off and non-opt-in profiles are byte-for-byte backward
+    /// compatible. When a strict enum *is* declared, any `effort_map` output
+    /// value outside the allowlist is a hard configuration error: this panics
+    /// at startup instead of silently normalizing or coercing an illegal wire
+    /// effort value.
+    pub fn validate_effort_enum(&self, provider: &str, effort_map: &HashMap<String, String>) {
+        let Some(allowlist) = &self.effort_enum else {
+            return; // not opted in — legacy effort maps stay valid
+        };
+        for (input, output) in effort_map {
+            if !allowlist.contains(output) {
+                panic!(
+                    "Provider '{}' cache_policy.effort_enum declares {:?}, but \
+                     effort_map maps '{}' -> '{}', which is outside the legal \
+                     wire effort set. Fix the effort_map output or drop the \
+                     strict enum.",
+                    provider, allowlist, input, output
+                );
+            }
+        }
     }
 }
 
@@ -821,12 +862,14 @@ mod tests {
         let enabled = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
             upstream: None,
+            effort_enum: None,
         };
         assert!(enabled.cache_usage_enabled());
 
         let binding_only = CachePolicy {
             usage: UsagePolicy::Off,
             upstream: Some("official".to_string()),
+            effort_enum: None,
         };
         assert!(
             !binding_only.cache_usage_enabled(),
@@ -853,6 +896,7 @@ mod tests {
         let policy = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
             upstream: Some("official".to_string()),
+            effort_enum: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let back: CachePolicy = serde_json::from_str(&json).unwrap();
@@ -861,6 +905,89 @@ mod tests {
             json,
             r#"{"usage":"top_level_cached_tokens","upstream":"official"}"#
         );
+    }
+
+    // --- Phase 3 P3-B: effort_enum validation (opt-in fail-fast) ---
+
+    fn kimi_effort_map() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("low".to_string(), "low".to_string());
+        m.insert("high".to_string(), "high".to_string());
+        m.insert("max".to_string(), "max".to_string());
+        m
+    }
+
+    #[test]
+    fn effort_enum_none_keeps_legacy_effort_maps_valid() {
+        // No opt-in (the default and every current config's state): legacy
+        // maps with medium/xhigh/none outputs must stay valid — validate() is
+        // a no-op and must never panic.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+        };
+        let mut legacy = HashMap::new();
+        legacy.insert("medium".to_string(), "medium".to_string());
+        legacy.insert("xhigh".to_string(), "max".to_string());
+        legacy.insert("none".to_string(), "none".to_string());
+        policy.validate_effort_enum("deepseek", &legacy); // must not panic
+    }
+
+    #[test]
+    fn effort_enum_accepts_all_outputs_in_declared_set() {
+        // Kimi official legal wire effort is exactly {low, high, max}: every
+        // output in the declared set validates cleanly.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+        };
+        policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn effort_enum_rejects_medium_output() {
+        // Explicit Kimi enum {low,high,max}: a `medium` output is an illegal
+        // wire effort and must fail fast at startup — never silently
+        // normalized, never coerced.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+        };
+        let mut map = kimi_effort_map();
+        map.insert("medium".to_string(), "medium".to_string());
+        policy.validate_effort_enum("moonshot", &map);
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_enum")]
+    fn effort_enum_rejects_xhigh_output() {
+        // The OSS `xhigh` acceptance must NOT be copied: under the Kimi
+        // enum an xhigh output (even when the enum itself is not accepted) is
+        // illegal and fails fast.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: None,
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+        };
+        let mut map = kimi_effort_map();
+        map.insert("xhigh".to_string(), "xhigh".to_string());
+        policy.validate_effort_enum("moonshot", &map);
     }
 
     // --- Phase 2b.2: fail-closed session cache key contract (T16-T19) ---
@@ -963,6 +1090,7 @@ mod tests {
         CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
             upstream: None,
+            effort_enum: None,
         }
     }
 
@@ -973,6 +1101,7 @@ mod tests {
             CacheStatsMode::from_policy(Some(&CachePolicy {
                 usage: UsagePolicy::Off,
                 upstream: None,
+                effort_enum: None,
             })),
             CacheStatsMode::Legacy,
             "explicit usage:off is still legacy (never activates)"
@@ -1010,6 +1139,7 @@ mod tests {
         let off = CachePolicy {
             usage: UsagePolicy::Off,
             upstream: None,
+            effort_enum: None,
         };
         assert_eq!(
             responses_usage_view(Some(&usage), Some(&off)),
@@ -1174,6 +1304,7 @@ mod tests {
         let off = CachePolicy {
             usage: UsagePolicy::Off,
             upstream: None,
+            effort_enum: None,
         };
         assert_eq!(chat_usage_view(Some(&usage), Some(&off)), view);
     }
