@@ -86,6 +86,41 @@ pub enum UsagePolicy {
     TopLevelCachedTokens,
 }
 
+/// Assistant-history replay policy (Phase 4b).
+///
+/// `Off` (the default) is the legacy gate: `reasoning_content` replay for
+/// stored assistant messages is decided by the **current** request's
+/// thinking/effort, so a historical message can be rewritten between turns
+/// when the client varies its thinking budget — busting the upstream prefix
+/// cache from that message onwards (report 34 K2 / OSS F5).
+///
+/// `FullAssistant` opts into replaying every stored assistant message in
+/// full (reasoning + text + tool_calls) independent of the current request's
+/// thinking budget or effort — the direct precedent is
+/// `raine/claude-code-proxy::push_assistant_message`, which unconditionally
+/// replays `thinking -> reasoning_content` and `tool_use -> tool_calls`
+/// without consulting the current request's effort. Activation additionally
+/// requires the canonical `"official"` upstream binding (see
+/// [`CachePolicy::full_assistant_replay_for_upstream`]); it never depends on
+/// a provider-name string (G7). The policy governs **history replay only** —
+/// the current request's own output control (`thinking.type` /
+/// `reasoning_effort`) is untouched and never resurrected by it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReplayPolicy {
+    /// Legacy gate: replay follows the current request's thinking/effort.
+    #[default]
+    Off,
+    /// Full assistant-history replay, independent of current request effort.
+    FullAssistant,
+}
+
+/// Whether a [`ReplayPolicy`] is the default (`Off`) — used to omit the
+/// field from serialized config so the default-off surface stays minimal.
+fn is_default_replay(value: &ReplayPolicy) -> bool {
+    *value == ReplayPolicy::default()
+}
+
 /// Declarative cache policy attached to a provider via
 /// [`crate::config::ProviderConfig::cache_policy`].
 ///
@@ -150,6 +185,21 @@ pub struct CachePolicy {
     /// a key (Kimi rides the Chat wire).
     #[serde(default, skip_serializing_if = "is_false")]
     pub prompt_cache_key_enabled: bool,
+    /// Assistant-history replay policy (Phase 4b).
+    ///
+    /// `Off` (default) keeps the legacy gate byte-for-byte: `reasoning_content`
+    /// replay is decided by the current request's thinking/effort, so a
+    /// historical assistant message can be rewritten between turns when the
+    /// client varies its budget. `FullAssistant` (opt-in, official Kimi
+    /// upstream only — see
+    /// [`Self::full_assistant_replay_for_upstream`]) replays stored assistant
+    /// reasoning/text/tool_calls independent of the current request,
+    /// matching `raine/claude-code-proxy::push_assistant_message`'s
+    /// unconditional replay. It governs history replay only: current-request
+    /// output control (`thinking.type` / `reasoning_effort`) is never
+    /// changed or resurrected by it.
+    #[serde(default, skip_serializing_if = "is_default_replay")]
+    pub replay: ReplayPolicy,
 }
 
 #[inline]
@@ -183,6 +233,22 @@ impl CachePolicy {
         } else {
             None
         }
+    }
+
+    /// Whether this policy opts into full assistant-history replay (Phase 4b).
+    ///
+    /// Returns `true` only when BOTH hold: this policy declares
+    /// `replay = FullAssistant` AND the provider's effective upstream binding
+    /// resolves to `"official"` (Kimi For Coding). Any other route — replay
+    /// off, or a provider routed through the default eswitch upstream —
+    /// returns `false` and keeps the legacy current-request-gated replay
+    /// byte-for-byte (fail-closed). The binding must be resolved data-driven
+    /// (never a provider-name string, G7); the converter calls this with
+    /// [`crate::config::Config::effective_upstream_binding`]. The policy
+    /// governs assistant-history replay only — it never touches the current
+    /// request's `thinking.type` / `reasoning_effort` output control.
+    pub fn full_assistant_replay_for_upstream(&self, effective_upstream: Option<&str>) -> bool {
+        self.replay == ReplayPolicy::FullAssistant && effective_upstream == Some("official")
     }
 
     /// Fail-fast startup validation of a provider's `effort_map` outputs
@@ -968,6 +1034,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         assert!(enabled.cache_usage_enabled());
@@ -977,6 +1044,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         assert!(
@@ -1012,6 +1080,7 @@ mod tests {
             usage: UsagePolicy::Off,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         };
@@ -1032,6 +1101,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -1063,6 +1133,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         let mut legacy = HashMap::new();
@@ -1085,6 +1156,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1105,6 +1177,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         let mut map = kimi_effort_map();
@@ -1127,6 +1200,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         let mut map = kimi_effort_map();
@@ -1173,6 +1247,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         let json = serde_json::to_string(&pinned).unwrap();
@@ -1203,6 +1278,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map());
@@ -1223,6 +1299,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: Some("medium".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map());
@@ -1242,6 +1319,7 @@ mod tests {
                     "high".to_string(),
                     "max".to_string(),
                 ]),
+                replay: crate::cache::ReplayPolicy::Off,
                 pinned_effort: Some(pin.to_string()),
             };
             policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1274,6 +1352,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1297,9 +1376,72 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map_without_low());
+    }
+
+    // --- Phase 4b: policy-gated full assistant-history replay (T06/T07) ---
+
+    #[test]
+    fn replay_policy_defaults_to_off() {
+        // Fail-closed default: absent config field -> Off (legacy gate). No
+        // provider is opted into full replay without an explicit declaration.
+        let policy = CachePolicy::default();
+        assert_eq!(policy.replay, ReplayPolicy::Off);
+        assert!(!policy.full_assistant_replay_for_upstream(Some("official")));
+        assert!(!policy.full_assistant_replay_for_upstream(None));
+
+        let absent: CachePolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.replay, ReplayPolicy::Off);
+        // Round-trip: default policy serializes with no replay field.
+        let json = serde_json::to_string(&CachePolicy::default()).unwrap();
+        assert!(
+            !json.contains("replay"),
+            "default-off replay must be omitted: {json}"
+        );
+    }
+
+    #[test]
+    fn replay_serde_accepts_full_assistant_and_roundtrips() {
+        // serde surface: `replay = "full_assistant"` parses, round-trips, and
+        // serializes under the snake_case name.
+        let policy: CachePolicy = serde_json::from_str(r#"{"replay":"full_assistant"}"#).unwrap();
+        assert_eq!(policy.replay, ReplayPolicy::FullAssistant);
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(
+            json.contains(r#""replay":"full_assistant""#),
+            "FullAssistant must serialize: {json}"
+        );
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.replay, ReplayPolicy::FullAssistant);
+        // Unknown replay values fail rather than silently defaulting.
+        assert!(serde_json::from_str::<CachePolicy>(r#"{"replay":"bogus"}"#).is_err());
+    }
+
+    #[test]
+    fn full_assistant_replay_gates_on_official_binding() {
+        // The gate is data-driven (G7, never a provider-name string):
+        // FullAssistant applies ONLY on the canonical "official" upstream.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            pinned_effort: None,
+            replay: ReplayPolicy::FullAssistant,
+        };
+        assert!(policy.full_assistant_replay_for_upstream(Some("official")));
+        assert!(!policy.full_assistant_replay_for_upstream(Some("eswitch")));
+        assert!(!policy.full_assistant_replay_for_upstream(None));
+
+        // Replay Off never opts in, even on the official upstream.
+        let off = CachePolicy {
+            replay: ReplayPolicy::Off,
+            ..policy.clone()
+        };
+        assert!(!off.full_assistant_replay_for_upstream(Some("official")));
     }
 
     // --- Phase 2b.2: fail-closed session cache key contract (T16-T19) ---
@@ -1404,6 +1546,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         }
     }
@@ -1417,6 +1560,7 @@ mod tests {
                 prompt_cache_key_enabled: false,
                 upstream: None,
                 effort_enum: None,
+                replay: crate::cache::ReplayPolicy::Off,
                 pinned_effort: None,
             })),
             CacheStatsMode::Legacy,
@@ -1457,6 +1601,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         assert_eq!(
@@ -1624,6 +1769,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
         };
         assert_eq!(chat_usage_view(Some(&usage), Some(&off)), view);

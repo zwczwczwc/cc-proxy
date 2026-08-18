@@ -73,6 +73,37 @@ pub(crate) fn convert_request_with_relocation(
         config,
     );
 
+    // Phase 4b (T06/T07): policy-gated full assistant-history replay.
+    //
+    // `include_reasoning` above is the LEGACY gate: it is decided by the
+    // CURRENT request's thinking/effort, so a stored assistant message's
+    // reasoning_content flips as the client varies its thinking budget —
+    // rewriting history and busting the upstream prefix cache from that
+    // message onwards. `replay_full` opts an explicit
+    // `cache_policy.replay = "full_assistant"` official-upstream route into
+    // replaying stored assistant reasoning/text/tool_calls in full,
+    // independent of the current request — the direct precedent is
+    // `raine/claude-code-proxy::push_assistant_message`'s unconditional
+    // replay (report 34 K2). The gate is resolved data-driven via
+    // `effective_upstream_binding` (never a provider-name string, G7), and
+    // it governs HISTORY REPLAY ONLY: the current request's own output
+    // control (`thinking.type` / `reasoning_effort`, set later via
+    // `apply_effort_direct`) is never changed or resurrected by it.
+    let replay_full = config
+        .model_profile(&upstream_model)
+        .and_then(|p| {
+            let binding = config.effective_upstream_binding(&p.provider);
+            config
+                .provider_config(&p.provider)
+                .and_then(|pc| pc.cache_policy.as_ref())
+                .map(|cp| cp.full_assistant_replay_for_upstream(binding))
+        })
+        .unwrap_or(false);
+    // Effective assistant-history replay gate: full replay overrides the
+    // legacy per-request gate when the policy opts in; otherwise the legacy
+    // behavior is preserved byte-for-byte.
+    let assistant_replay = replay_full || include_reasoning;
+
     // Build OpenAI messages
     // Feature flag: relocate volatile env blocks from system prefix to last user turn
     // to stabilise KV cache prefix across turns.
@@ -101,7 +132,7 @@ pub(crate) fn convert_request_with_relocation(
         (req.system.clone(), req.messages.clone())
     };
     let messages =
-        build_chat_messages_with_reasoning(system.as_ref(), &messages_ref, include_reasoning);
+        build_chat_messages_with_reasoning(system.as_ref(), &messages_ref, assistant_replay);
 
     let stream = req.stream.unwrap_or(false);
 
@@ -1306,6 +1337,7 @@ mod tests {
             usage: crate::cache::UsagePolicy::Off,
             upstream: Some("official".to_string()),
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
@@ -1447,6 +1479,7 @@ mod tests {
             usage: crate::cache::UsagePolicy::Off,
             upstream: None,
             effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
@@ -1503,6 +1536,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: pin.map(|s| s.to_string()),
             prompt_cache_key_enabled: false,
         });
@@ -1638,6 +1672,7 @@ mod tests {
                 "high".to_string(),
                 "max".to_string(),
             ]),
+            replay: crate::cache::ReplayPolicy::Off,
             pinned_effort: Some("high".to_string()),
             prompt_cache_key_enabled: false,
         });
@@ -1712,5 +1747,315 @@ mod tests {
             "explicit disabled thinking must NOT be pinned to high"
         );
         assert!(result.thinking.is_none(), "Kimi K3 has no thinking.type");
+    }
+
+    // --- Phase 4b: policy-gated full assistant-history replay (T06/T07) ---
+    //
+    // The legacy gate (`include_reasoning` in `should_replay_reasoning_content`)
+    // is decided by the CURRENT request's thinking/effort, so a stored
+    // assistant message's reasoning_content flips as the client varies its
+    // thinking budget — rewriting history and busting the upstream prefix
+    // cache from that message onwards. With `cache_policy.replay =
+    // "full_assistant"` + the canonical official upstream (data-driven, G7),
+    // stored assistant reasoning/text/tool_calls must be replayed in full,
+    // independent of the current request. Current-request OUTPUT control
+    // (thinking.type / reasoning_effort) is never changed or resurrected.
+
+    /// Config with the canonical `moonshot` provider bound to the official
+    /// upstream, declaring the Kimi effort enum and a given replay policy.
+    fn kimi_replay_config(replay: crate::cache::ReplayPolicy) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay,
+        });
+        config
+    }
+
+    /// kimi-k3 request whose history contains the given stored assistant
+    /// parts followed by a user turn, sent under the given current thinking
+    /// config.
+    fn kimi_history_req(
+        thinking: Option<ThinkingConfig>,
+        parts: Vec<ContentBlock>,
+    ) -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(parts),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("Next question".to_string()),
+            },
+        ];
+        req.thinking = thinking;
+        req
+    }
+
+    fn thinking_disabled() -> ThinkingConfig {
+        ThinkingConfig::Disabled {
+            config_type: "disabled".to_string(),
+        }
+    }
+
+    fn thinking_enabled(budget: u32) -> ThinkingConfig {
+        ThinkingConfig::Enabled {
+            config_type: "enabled".to_string(),
+            budget_tokens: Some(budget),
+            display: None,
+        }
+    }
+
+    fn asst_msg(messages: &[Value]) -> &Value {
+        messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .expect("history contains an assistant message")
+    }
+
+    #[test]
+    fn replay_off_keeps_legacy_current_effort_gating() {
+        // Golden policy-off baseline: `replay = off` (the default) preserves
+        // the legacy gate byte-for-byte — with the current request's thinking
+        // disabled, stored historical reasoning is NOT replayed, even on the
+        // official Kimi upstream.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::Off);
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me think about this.".to_string(),
+                    signature: "sig123".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Here is the answer.".to_string(),
+                },
+            ],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(
+            asst.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "replay off keeps the legacy gate: reasoning dropped under disabled thinking"
+        );
+        assert_eq!(asst["content"], "Here is the answer.");
+    }
+
+    #[test]
+    fn full_replay_preserves_historical_reasoning_across_current_effort_flip() {
+        // T07: with `replay = full_assistant`, a stored assistant
+        // reasoning+text message is replayed in FULL even when the CURRENT
+        // request has thinking disabled (effort flip). Historical
+        // reasoning_content must be preserved regardless of the current
+        // request's budget.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me think about this.".to_string(),
+                    signature: "sig123".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Here is the answer.".to_string(),
+                },
+            ],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert_eq!(
+            asst.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("Let me think about this."),
+            "full replay must preserve stored reasoning under a disabled current request"
+        );
+        assert_eq!(asst["content"], "Here is the answer.");
+        // Current-request OUTPUT control is NOT resurrected: no thinking.type
+        // and the disabled request maps to the lowest Kimi effort (never
+        // enabled, never pinned).
+        assert!(result.thinking.is_none(), "no thinking.type for Kimi");
+        assert_eq!(result.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn full_replay_history_is_byte_stable_across_current_effort_flips() {
+        // T07 core: the wire form of the stored assistant history must be
+        // IDENTICAL no matter the current request's thinking budget/effort.
+        // The same history converted under thinking-disabled and
+        // thinking-enabled(max) yields byte-equal outbound messages.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let parts = vec![
+            ContentBlock::Thinking {
+                thinking: "step one".to_string(),
+                signature: "sig1".to_string(),
+            },
+            ContentBlock::Text {
+                text: "analysis".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/tmp/x"}),
+            },
+            ContentBlock::ToolUse {
+                id: "call_2".to_string(),
+                name: "grep".to_string(),
+                input: serde_json::json!({"pattern": "foo"}),
+            },
+            ContentBlock::Text {
+                text: "done".to_string(),
+            },
+        ];
+        let enabled = kimi_history_req(Some(thinking_enabled(16000)), parts.clone());
+        let disabled = kimi_history_req(Some(thinking_disabled()), parts);
+        let r1 = convert_request_with_relocation(&enabled, &config, false).unwrap();
+        let r2 = convert_request_with_relocation(&disabled, &config, false).unwrap();
+        assert_eq!(
+            r1.messages, r2.messages,
+            "stored assistant history must be byte-stable across current effort flips"
+        );
+        // And it genuinely carries the full assistant message.
+        let asst = asst_msg(&r2.messages);
+        assert_eq!(
+            asst.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("step one")
+        );
+        assert_eq!(asst["content"], "analysis\ndone");
+        let calls = asst["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[1]["id"], "call_2");
+    }
+
+    #[test]
+    fn full_replay_keeps_placeholder_for_toolcall_without_reasoning() {
+        // T07 / kimi=keep: a stored tool-call assistant message with NO
+        // reasoning keeps the safe "(reasoning omitted)" placeholder under
+        // full replay — it is NOT switched to omit without a controlled
+        // probe (report 34 / plan §3.4 note).
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+            }],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(asst["tool_calls"].is_array());
+        assert_eq!(
+            asst.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("(reasoning omitted)"),
+            "kimi=keep: placeholder retained for tool-call without reasoning"
+        );
+    }
+
+    #[test]
+    fn full_replay_without_official_binding_stays_legacy() {
+        // Fail-closed: `replay = full_assistant` WITHOUT the canonical
+        // "official" upstream binding leaves the legacy gate intact
+        // (data-driven gate, G7 — never a provider-name string).
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay: crate::cache::ReplayPolicy::FullAssistant,
+        });
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "secret reasoning".to_string(),
+                    signature: "sig".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(
+            asst.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "no official binding => full replay must not activate"
+        );
+    }
+
+    #[test]
+    fn full_replay_does_not_apply_to_non_moonshot_providers() {
+        // Non-moonshot providers are untouched: a deepseek request with a
+        // cache_policy.replay = full_assistant but no official binding (and no
+        // policy at all) keeps the legacy gate byte-for-byte.
+        let config = test_config();
+        let mut req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "ds reasoning".to_string(),
+                    signature: "sig".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "ds answer".to_string(),
+                },
+            ],
+        );
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(
+            asst.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "deepseek legacy behavior unchanged under disabled thinking"
+        );
+    }
+
+    #[test]
+    fn full_replay_does_not_inject_prompt_cache_key() {
+        // Phase 4b is history-only: no prompt_cache_key changes (no P3-C
+        // opt-in), even with a stable metadata.user_id present.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let mut req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "r".to_string(),
+                    signature: "s".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "a".to_string(),
+                },
+            ],
+        );
+        req.metadata = Some(crate::anthropic::types::Metadata {
+            user_id: Some("user-42".to_string()),
+        });
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
     }
 }
