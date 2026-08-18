@@ -1502,4 +1502,46 @@ max = "max"
         );
         config.validate(); // must not panic
     }
+
+    // --- Phase 4a remediation (S1): pin must be an actual effort_map key ---
+
+    #[test]
+    #[should_panic(expected = "effort_map")]
+    fn validate_rejects_pinned_effort_missing_from_effort_map() {
+        // S1: the pin is a member of the declared effort_enum BUT not a key
+        // of the provider's effort_map. Without this gate,
+        // `apply_effort_direct`'s `effort_map.get(pin).unwrap_or("high")`
+        // (converter.rs `_ =>` branch) would SILENTLY coerce the pin to
+        // "high" on the wire, contradicting the "never silently coerced"
+        // promise. A missing key must fail fast at startup.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(kimi_effort_enum()),
+            pinned_effort: Some("low".to_string()),
+        };
+        // effort_map deliberately missing the "low" key (only high/max).
+        let mut map = HashMap::new();
+        map.insert("high".to_string(), "high".to_string());
+        map.insert("max".to_string(), "max".to_string());
+        let config = moonshot_config_with_policy(policy, map);
+        config.validate(); // should panic: pin "low" is not an effort_map key
+    }
+
+    #[test]
+    fn validate_accepts_pinned_effort_that_is_an_effort_map_key() {
+        // S1 remediation guard: a pin that IS both in the declared enum and a
+        // key of the provider's effort_map validates cleanly (the shape of
+        // every built-in moonshot effort_map).
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(kimi_effort_enum()),
+            pinned_effort: Some("low".to_string()),
+        };
+        let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
+        config.validate(); // must not panic
+    }
 }

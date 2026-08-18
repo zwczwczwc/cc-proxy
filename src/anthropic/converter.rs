@@ -1681,4 +1681,36 @@ mod tests {
         let body = serde_json::to_value(&result).unwrap();
         assert!(body.get("prompt_cache_key").is_none());
     }
+
+    // --- Phase 4a remediation (S2): explicit disabled thinking wins over pin ---
+
+    /// kimi-k3 request with `thinking` explicitly DISABLED (the client asked
+    /// for no reasoning at all).
+    fn kimi_req_with_thinking_disabled() -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.thinking = Some(ThinkingConfig::Disabled {
+            config_type: "disabled".to_string(),
+        });
+        req
+    }
+
+    #[test]
+    fn pinned_effort_with_explicit_disabled_thinking_stays_disabled() {
+        // S2: a declared pin must NOT resurrect reasoning when the client
+        // explicitly disabled thinking. The converter's disabled branch
+        // (converter.rs `else` → apply_effort_direct("off")) runs regardless
+        // of the pin — for Kimi (disable_thinking=true) that maps to the
+        // lowest effort with no thinking.type, never the pinned effort.
+        let config = kimi_pinned_config(Some("high"));
+        let result =
+            convert_request_with_relocation(&kimi_req_with_thinking_disabled(), &config, false)
+                .unwrap();
+        // Kimi can't turn off thinking entirely; disabled => lowest effort.
+        assert_eq!(
+            result.reasoning_effort.as_deref(),
+            Some("low"),
+            "explicit disabled thinking must NOT be pinned to high"
+        );
+        assert!(result.thinking.is_none(), "Kimi K3 has no thinking.type");
+    }
 }

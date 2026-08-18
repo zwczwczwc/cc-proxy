@@ -122,6 +122,12 @@ pub struct CachePolicy {
     /// `reasoning_effort` never flips as the client varies its thinking
     /// budget between requests.
     ///
+    /// The pin must name an actual key of the provider's `effort_map`
+    /// (validated at startup by [`Self::validate_effort_enum`]): the effort
+    /// is resolved through that map on the wire, so a pin absent from the map
+    /// would otherwise be silently coerced to `high` — a hard config error,
+    /// never a silent fallback.
+    ///
     /// This is a **static, stateless pin** declared in config: it does NOT
     /// "capture the first request's effort and remember it per session".
     /// True per-session derivation would require implicit server-side session
@@ -191,6 +197,12 @@ impl CachePolicy {
     /// value outside the allowlist is a hard configuration error: this panics
     /// at startup instead of silently normalizing or coercing an illegal wire
     /// effort value.
+    ///
+    /// Phase 4a additionally requires a declared `pinned_effort` to (1) be a
+    /// member of the enum and (2) be an actual key of the provider's
+    /// `effort_map` — the effort is resolved through that map on the wire, so
+    /// a pin absent from the map would otherwise be silently coerced to
+    /// `high` by `apply_effort_direct`. Both failures panic at startup.
     pub fn validate_effort_enum(&self, provider: &str, effort_map: &HashMap<String, String>) {
         let Some(allowlist) = &self.effort_enum else {
             // Fail-closed: a pinned effort is a wire-effort promise and must
@@ -229,6 +241,24 @@ impl CachePolicy {
                      the declared effort_enum {:?}. Legal wire efforts for \
                      this provider are exactly the declared set.",
                     provider, pinned, allowlist
+                );
+            }
+            // Phase 4a remediation (S1): the pin must ALSO be an actual key of
+            // the provider's effort_map. `apply_effort_direct` resolves effort
+            // through the map (`effort_map.get(effort).unwrap_or("high")`), so
+            // a pin that is a legal enum member but absent from the map would
+            // be SILENTLY coerced to "high" on the wire — the exact
+            // "never silently coerced" promise this validator makes. A missing
+            // key is a hard config error and must fail fast at startup.
+            if !effort_map.contains_key(pinned) {
+                panic!(
+                    "Provider '{}' cache_policy.pinned_effort '{}' is not a \
+                     key of the provider effort_map {:?}. A pinned effort must \
+                     name an actual effort_map input so it is applied verbatim \
+                     on the wire — never silently coerced.",
+                    provider,
+                    pinned,
+                    effort_map.keys().collect::<Vec<_>>()
                 );
             }
         }
@@ -1216,6 +1246,60 @@ mod tests {
             };
             policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
         }
+    }
+
+    // --- Phase 4a remediation (S1): pin must be an actual effort_map key ---
+
+    /// A map whose keys are a strict subset of the Kimi enum — deliberately
+    /// MISSING the "low" key so the S1 fail-fast path can be exercised.
+    fn kimi_effort_map_without_low() -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert("high".to_string(), "high".to_string());
+        m.insert("max".to_string(), "max".to_string());
+        m
+    }
+
+    #[test]
+    fn pinned_effort_present_as_effort_map_key_passes_validation() {
+        // S1 remediation guard: a pin that IS a key of the provider's
+        // effort_map (and in the declared enum) stays valid. This is the
+        // shape of every built-in moonshot effort_map, so no opt-in provider
+        // in production is affected.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: Some("low".to_string()),
+        };
+        policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
+    }
+
+    #[test]
+    #[should_panic(expected = "effort_map")]
+    fn pinned_effort_missing_from_effort_map_fails_fast() {
+        // S1: the pin is a legal wire effort (member of effort_enum) but the
+        // provider's effort_map does NOT contain it as a key. Without this
+        // check, `apply_effort_direct`'s `effort_map.get(pin).unwrap_or("high")`
+        // (converter.rs `_ =>` branch) would SILENTLY coerce the pin to "high"
+        // on the wire — contradicting the "never silently coerced" promise.
+        // A missing key must fail fast at startup with a clear error.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: Some("low".to_string()),
+        };
+        policy.validate_effort_enum("moonshot", &kimi_effort_map_without_low());
     }
 
     // --- Phase 2b.2: fail-closed session cache key contract (T16-T19) ---
