@@ -995,6 +995,7 @@ max = "max"
                     effort_enum: None,
                     replay: crate::cache::ReplayPolicy::Off,
                     history: crate::cache::HistoryPolicy::Off,
+                    relocate: crate::cache::RelocatePolicy::Off,
                     pinned_effort: None,
                 }),
             },
@@ -1080,6 +1081,7 @@ max = "max"
                     effort_enum: None,
                     replay: crate::cache::ReplayPolicy::Off,
                     history: crate::cache::HistoryPolicy::Off,
+                    relocate: crate::cache::RelocatePolicy::Off,
                     pinned_effort: None,
                 }),
             },
@@ -1378,6 +1380,7 @@ max = "max"
             effort_enum: Some(kimi_effort_enum()),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
@@ -1398,6 +1401,7 @@ max = "max"
             effort_enum: Some(kimi_effort_enum()),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[("medium", "medium")]));
@@ -1416,6 +1420,7 @@ max = "max"
             effort_enum: Some(kimi_effort_enum()),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[("xhigh", "xhigh")]));
@@ -1434,6 +1439,7 @@ max = "max"
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         };
         let config = moonshot_config_with_policy(
@@ -1457,6 +1463,7 @@ max = "max"
                 effort_enum: Some(kimi_effort_enum()),
                 replay: crate::cache::ReplayPolicy::Off,
                 history: crate::cache::HistoryPolicy::Off,
+                relocate: crate::cache::RelocatePolicy::Off,
                 pinned_effort: Some(pin.to_string()),
             };
             let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
@@ -1477,6 +1484,7 @@ max = "max"
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
@@ -1496,6 +1504,7 @@ max = "max"
             effort_enum: Some(kimi_effort_enum()),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: Some("medium".to_string()),
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[]));
@@ -1514,6 +1523,7 @@ max = "max"
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         };
         let config = moonshot_config_with_policy(
@@ -1541,6 +1551,7 @@ max = "max"
             effort_enum: Some(kimi_effort_enum()),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         // effort_map deliberately missing the "low" key (only high/max).
@@ -1563,6 +1574,7 @@ max = "max"
             effort_enum: Some(kimi_effort_enum()),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         let config = moonshot_config_with_policy(policy, effort_map_with(&[]));

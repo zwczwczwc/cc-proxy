@@ -130,11 +130,57 @@ pub(crate) fn convert_request_with_relocation(
         })
         .unwrap_or(false);
 
+    // Phase 4d: policy-gated split-tail relocation of volatile system blocks.
+    //
+    // `cache_policy.relocate = "split_tail"` opts an explicit
+    // official-upstream route into splitting volatile env blocks out of the
+    // cache-prefix-sensitive system position and relocating them to a
+    // deterministic conversation tail WITHOUT rewriting already-constructed
+    // stable history. The gate is resolved data-driven via
+    // `effective_upstream_binding` (never a provider-name string, G7), and it
+    // governs SYSTEM-PROMPT RELOCATION ONLY: assistant reasoning replay
+    // (`replay_full`/`include_reasoning`, Phase 4b), stored-history
+    // preservation (`append_only`, Phase 4c) and current-request output
+    // control are never touched by it. Every non-opt-in route — policy off,
+    // no official binding, non-Kimi providers — keeps the legacy env-driven
+    // `CODEMERMAFROST_RELOCATE` path byte-for-byte (fail-closed).
+    let split_tail = config
+        .model_profile(&upstream_model)
+        .and_then(|p| {
+            let binding = config.effective_upstream_binding(&p.provider);
+            config
+                .provider_config(&p.provider)
+                .and_then(|pc| pc.cache_policy.as_ref())
+                .map(|cp| cp.split_tail_relocate_for_upstream(binding))
+        })
+        .unwrap_or(false);
+
     // Build OpenAI messages
-    // Feature flag: relocate volatile env blocks from system prefix to last user turn
-    // to stabilise KV cache prefix across turns.
-    // Controlled by env var CODEMERMAFROST_RELOCATE.
-    let (system, messages_ref) = if relocate {
+    // Phase 4d split-tail: policy-gated relocation of volatile env blocks
+    // from the system prefix to a deterministic conversation tail, without
+    // rewriting stable history (official Kimi upstream only).
+    // Legacy: env var CODEMERMAFROST_RELOCATE controls the migrate path.
+    let (system, messages_ref) = if split_tail {
+        let raw_system = req
+            .system
+            .clone()
+            .unwrap_or(SystemPrompt::Text(String::new()));
+        // Step 1: stabilize billing nonce (permafrost_align.py L149-L177)
+        let system = crate::reasoning::relocate::stabilize_metadata(raw_system);
+        // Step 2: split volatile env blocks to the conversation tail
+        // (no mutation of already-constructed stable history).
+        let (new_system, new_messages) = crate::reasoning::relocate::relocate_volatile_to_chat_tail(
+            system,
+            req.messages.clone(),
+        );
+        let messages = new_messages;
+        let system_opt = if matches!(new_system, SystemPrompt::Text(ref t) if t.is_empty()) {
+            None
+        } else {
+            Some(new_system)
+        };
+        (system_opt, messages)
+    } else if relocate {
         let raw_system = req
             .system
             .clone()
@@ -1369,6 +1415,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
@@ -1512,6 +1559,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         });
@@ -1570,6 +1618,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: pin.map(|s| s.to_string()),
             prompt_cache_key_enabled: false,
         });
@@ -1707,6 +1756,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: Some("high".to_string()),
             prompt_cache_key_enabled: false,
         });
@@ -1815,6 +1865,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             replay,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
         });
         config
     }
@@ -2017,6 +2068,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             replay: crate::cache::ReplayPolicy::FullAssistant,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
         });
         let req = kimi_history_req(
             Some(thinking_disabled()),
@@ -2126,6 +2178,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             replay: crate::cache::ReplayPolicy::Off,
             history,
+            relocate: crate::cache::RelocatePolicy::Off,
         });
         config
     }
@@ -2258,6 +2311,7 @@ mod tests {
             prompt_cache_key_enabled: false,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::AppendOnly,
+            relocate: crate::cache::RelocatePolicy::Off,
         });
         let result =
             convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
@@ -2312,5 +2366,289 @@ mod tests {
         assert_eq!(result.prompt_cache_key, None);
         let body = serde_json::to_value(&result).unwrap();
         assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4d: Kimi-only policy-gated split-tail relocation ---
+    //
+    // Data-driven (G7): Chat split-tail relocation activates ONLY when an
+    // explicit `cache_policy.relocate = "split_tail"` opt-in AND the
+    // effective upstream binding resolves to the canonical `"official"`
+    // upstream. Everything else — policy off, no official binding, non-Kimi
+    // providers — keeps the legacy env-driven (`CODEMERMAFROST_RELOCATE`)
+    // relocation path byte-for-byte.
+
+    /// Config with the canonical `moonshot` provider bound to `official`
+    /// and declaring `relocate = split_tail` (plus an optional upstream
+    /// override for fail-closed tests).
+    fn kimi_split_tail_config(upstream: Option<&str>) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: upstream.map(|s| s.to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            relocate: crate::cache::RelocatePolicy::SplitTail,
+        });
+        config
+    }
+
+    /// kimi-k3 request with a volatile env system block and a plain
+    /// user text turn as the current request.
+    fn kimi_env_system_req() -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.system = Some(SystemPrompt::Blocks(vec![
+            SystemContentBlock {
+                block_type: "text".to_string(),
+                text: "You are a helpful assistant.".to_string(),
+            },
+            SystemContentBlock {
+                block_type: "text".to_string(),
+                text: "<env>\nWorking directory: /tmp\nToday's date: 2026-06-22\n</env>"
+                    .to_string(),
+            },
+        ]));
+        req.messages = vec![Message {
+            role: "user".to_string(),
+            content: ContentValue::Text("hello".to_string()),
+        }];
+        req
+    }
+
+    fn wire_messages(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        body["messages"]
+            .as_array()
+            .expect("outbound messages array")
+            .clone()
+    }
+
+    fn wire_system_content(body: &serde_json::Value) -> String {
+        let messages = wire_messages(body);
+        let sys = messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .expect("outbound system message");
+        sys["content"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn split_tail_requires_official_binding_fail_closed() {
+        // `relocate = split_tail` WITHOUT the official binding must keep the
+        // legacy path: with the env gate off, the volatile block stays in
+        // the system prompt (fail-closed, data-driven gate).
+        let config = kimi_split_tail_config(None);
+        let result =
+            convert_request_with_relocation(&kimi_env_system_req(), &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let sys = wire_system_content(&body);
+        assert!(
+            sys.contains("<env>") && sys.contains("Today's date"),
+            "no official binding => env block must remain in system: {sys}"
+        );
+    }
+
+    #[test]
+    fn split_tail_non_moonshot_provider_inactive() {
+        // A non-Kimi provider (deepseek) declaring split_tail is untouched:
+        // its effective binding is not official (no policy upstream, no
+        // moonshot-official alias), so the legacy path applies and the env
+        // block stays in the system prompt.
+        let mut config = test_config();
+        let deepseek = config.providers.get_mut("deepseek").unwrap();
+        deepseek.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            relocate: crate::cache::RelocatePolicy::SplitTail,
+        });
+        let mut req = kimi_env_system_req();
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(
+            wire_system_content(&body).contains("Today's date"),
+            "non-moonshot split_tail must be inactive (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn split_tail_official_kimi_moves_volatile_to_tail_full_converter_path() {
+        // Full inbound converter path: kimi + split_tail + official binding
+        // moves the volatile env block out of the cache-prefix-sensitive
+        // system position into the tail of the last user turn, keeping the
+        // stable system block in the prefix.
+        let config = kimi_split_tail_config(Some("official"));
+        let result =
+            convert_request_with_relocation(&kimi_env_system_req(), &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let sys = wire_system_content(&body);
+        assert!(
+            sys.contains("You are a helpful assistant."),
+            "stable system must stay in prefix: {sys}"
+        );
+        assert!(
+            !sys.contains("Today's date"),
+            "volatile env block must leave the system prefix: {sys}"
+        );
+        let messages = wire_messages(&body);
+        assert_eq!(messages.len(), 2, "system + merged user turn");
+        let last = &messages[messages.len() - 1];
+        assert_eq!(last["role"], "user");
+        let last_content = last["content"].as_str().unwrap_or("");
+        assert!(
+            last_content.contains("permafrost:relocated-context")
+                && last_content.contains("Today's date"),
+            "volatile context must be relocated to the tail: {last_content}"
+        );
+    }
+
+    #[test]
+    fn split_tail_policy_off_keeps_legacy_env_relocate_behavior() {
+        // Policy off (default, no cache_policy) + legacy env gate on
+        // (`relocate = true`) must keep the legacy migrate behavior: the
+        // env block moves into the last user turn exactly as before (the
+        // golden `*_relocate_true` snapshots verify this byte-for-byte).
+        let config = test_config();
+        let result =
+            convert_request_with_relocation(&kimi_env_system_req(), &config, true).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(!wire_system_content(&body).contains("Today's date"));
+        let messages = wire_messages(&body);
+        assert_eq!(messages.len(), 2, "system + merged user turn (legacy)");
+        let last = &messages[messages.len() - 1];
+        assert_eq!(last["role"], "user");
+        assert!(
+            last["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("permafrost:relocated-context"),
+            "legacy env relocate still merges into the last user turn"
+        );
+    }
+
+    #[test]
+    fn split_tail_does_not_rewrite_stable_history() {
+        // Multi-turn kimi request: earlier (stable) history is emitted
+        // byte-for-byte — only the tail of the final user turn carries the
+        // relocated context.
+        let config = kimi_split_tail_config(Some("official"));
+        let mut req = kimi_env_system_req();
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("first user turn".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Text("first answer".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("second user turn".to_string()),
+            },
+        ];
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let messages = wire_messages(&body);
+        assert_eq!(messages.len(), 4, "system + 3 history turns");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "first user turn");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "first answer");
+        let last = &messages[3];
+        assert_eq!(last["role"], "user");
+        let text = last["content"].as_str().unwrap_or("");
+        assert!(text.starts_with("second user turn"));
+        assert!(text.contains("Today's date"));
+        assert!(
+            !messages[1]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Today's date"),
+            "stable history must not carry relocated context"
+        );
+    }
+
+    #[test]
+    fn split_tail_is_deterministic_across_calls() {
+        // golden-3 determinism: the same request encodes to the identical
+        // outbound body every time (deterministic tail, no random order).
+        let config = kimi_split_tail_config(Some("official"));
+        let req = kimi_env_system_req();
+        let a =
+            serde_json::to_value(convert_request_with_relocation(&req, &config, false).unwrap())
+                .unwrap();
+        let b =
+            serde_json::to_value(convert_request_with_relocation(&req, &config, false).unwrap())
+                .unwrap();
+        assert_eq!(a, b, "split-tail encode must be deterministic");
+    }
+
+    #[test]
+    fn split_tail_tool_history_tail_shape_preserves_alternation() {
+        // Tool-history shape: the stored history ends with a `user` message
+        // carrying tool_result blocks (renders to `tool` role on the Chat
+        // wire). The volatile appendix cannot merge into it (would be
+        // dropped), so a synthetic `user` tail is appended — the outbound
+        // wire ends assistant(tool_calls) -> tool -> user, which preserves
+        // Chat role alternation and never yields user-after-user.
+        let config = kimi_split_tail_config(Some("official"));
+        let mut req = kimi_env_system_req();
+        req.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: crate::anthropic::types::ToolResultContent::Text("ok".to_string()),
+                    is_error: None,
+                }]),
+            },
+        ];
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let messages = wire_messages(&body);
+        assert_eq!(
+            messages.len(),
+            4,
+            "system + assistant(tool_calls) + tool + synthetic user"
+        );
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["system", "assistant", "tool", "user"]);
+        // The tool role message (call-1 result) is emitted before the tail.
+        let tool_msg = &messages[2];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "call-1");
+        // The synthetic tail is the last item.
+        let last = &messages[3];
+        assert_eq!(last["role"], "user");
+        let text = last["content"].as_str().unwrap_or("");
+        assert!(
+            text.contains("permafrost:relocated-context") && text.contains("Today's date"),
+            "synthetic tail must carry the relocated volatile context"
+        );
+        let assistant = &messages[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
     }
 }

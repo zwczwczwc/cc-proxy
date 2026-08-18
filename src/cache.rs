@@ -157,6 +157,36 @@ fn is_default_history(value: &HistoryPolicy) -> bool {
     *value == HistoryPolicy::default()
 }
 
+/// Volatile-context relocation policy (Phase 4d).
+///
+/// `Off` (the default) keeps the legacy relocation path byte-for-byte: the
+/// Chat encoder relocates volatile env blocks only when the process-level
+/// `CODEMERMAFROST_RELOCATE` env var is present, and the relocation appends
+/// into the last message (`migrate_volatile_system_blocks`). The Responses
+/// encoder is unaffected.
+///
+/// `SplitTail` opts into the data-driven Kimi split-tail relocation: volatile
+/// system blocks are split out of the cache-prefix-sensitive system position
+/// and moved to the conversation tail without rewriting already-constructed
+/// stable history. Activation additionally requires the canonical `"official"`
+/// upstream binding (see [`CachePolicy::split_tail_relocate_for_upstream`]);
+/// it never depends on a provider-name string (G7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelocatePolicy {
+    /// Legacy: relocation gated by the `CODEMERMAFROST_RELOCATE` env var.
+    #[default]
+    Off,
+    /// Kimi official: split volatile system blocks to the conversation tail.
+    SplitTail,
+}
+
+/// Whether a [`RelocatePolicy`] is the default (`Off`) — used to omit the
+/// field from serialized config so the default-off surface stays minimal.
+fn is_default_relocate(value: &RelocatePolicy) -> bool {
+    *value == RelocatePolicy::default()
+}
+
 /// Declarative cache policy attached to a provider via
 /// [`crate::config::ProviderConfig::cache_policy`].
 ///
@@ -251,6 +281,19 @@ pub struct CachePolicy {
     /// untouched.
     #[serde(default, skip_serializing_if = "is_default_history")]
     pub history: HistoryPolicy,
+    /// Volatile-context relocation policy (Phase 4d).
+    ///
+    /// `Off` (default) keeps the legacy env-driven `CODEMERMAFROST_RELOCATE`
+    /// relocation path byte-for-byte. `SplitTail` (opt-in, official Kimi
+    /// upstream only — see
+    /// [`Self::split_tail_relocate_for_upstream`]) splits volatile system
+    /// blocks out of the cache-prefix-sensitive system position and moves
+    /// them to the conversation tail without rewriting already-constructed
+    /// stable history. It governs system-prompt relocation only: assistant
+    /// reasoning replay (`Self::replay`), stored-history preservation
+    /// (`Self::history`) and current-request output control are untouched.
+    #[serde(default, skip_serializing_if = "is_default_relocate")]
+    pub relocate: RelocatePolicy,
 }
 
 #[inline]
@@ -318,6 +361,24 @@ impl CachePolicy {
     /// nor the assistant reasoning replay policy (`Self::replay`).
     pub fn append_only_history_for_upstream(&self, effective_upstream: Option<&str>) -> bool {
         self.history == HistoryPolicy::AppendOnly && effective_upstream == Some("official")
+    }
+
+    /// Whether this policy opts into split-tail volatile-context relocation
+    /// (Phase 4d).
+    ///
+    /// Returns `true` only when BOTH hold: this policy declares
+    /// `relocate = SplitTail` AND the provider's effective upstream binding
+    /// resolves to `"official"` (Kimi For Coding). Any other route — relocate
+    /// off, or a provider routed through the default eswitch upstream —
+    /// returns `false` and keeps the legacy env-driven relocation path
+    /// byte-for-byte (fail-closed). The binding must be resolved data-driven
+    /// (never a provider-name string, G7); the converter calls this with
+    /// [`crate::config::Config::effective_upstream_binding`]. The policy
+    /// governs system-prompt relocation only — it never touches assistant
+    /// reasoning replay (`Self::replay`), stored-history preservation
+    /// (`Self::history`) nor current-request output control.
+    pub fn split_tail_relocate_for_upstream(&self, effective_upstream: Option<&str>) -> bool {
+        self.relocate == RelocatePolicy::SplitTail && effective_upstream == Some("official")
     }
 
     /// Fail-fast startup validation of a provider's `effort_map` outputs
@@ -1105,6 +1166,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         assert!(enabled.cache_usage_enabled());
@@ -1116,6 +1178,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         assert!(
@@ -1153,6 +1216,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
             prompt_cache_key_enabled: true,
         };
@@ -1175,6 +1239,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         let json = serde_json::to_string(&policy).unwrap();
@@ -1183,6 +1248,93 @@ mod tests {
         assert_eq!(
             json,
             r#"{"usage":"top_level_cached_tokens","upstream":"official"}"#
+        );
+    }
+
+    // --- Phase 4d: RelocatePolicy (volatile-context split-tail relocation) ---
+
+    #[test]
+    fn relocate_policy_defaults_off_and_omitted_from_serialized_config() {
+        // Default-off surface stays minimal: a policy with relocate Off
+        // serializes without the field (skip_serializing_if), and missing
+        // input deserializes to Off (fail-closed).
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        assert_eq!(json, r#"{"usage":"off","upstream":"official"}"#);
+        assert!(
+            !json.contains("relocate"),
+            "default relocate=off must be omitted: {json}"
+        );
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.relocate, RelocatePolicy::Off);
+        let empty: CachePolicy = serde_json::from_str("{}").unwrap();
+        assert_eq!(empty.relocate, RelocatePolicy::Off);
+    }
+
+    #[test]
+    fn relocate_policy_serde_roundtrip_split_tail() {
+        // Explicit split_tail round-trips through the serialized config.
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            relocate: RelocatePolicy::SplitTail,
+        };
+        let json = serde_json::to_string(&policy).unwrap();
+        assert!(
+            json.contains(r#""relocate":"split_tail""#),
+            "split_tail must serialize: {json}"
+        );
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.relocate, RelocatePolicy::SplitTail);
+        assert_eq!(back, policy);
+    }
+
+    #[test]
+    fn split_tail_gate_requires_policy_and_official_binding() {
+        // Data-driven activation: relocate=split_tail alone is not enough —
+        // the effective upstream binding must resolve to the canonical
+        // "official" upstream (fail-closed otherwise).
+        let policy = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            relocate: RelocatePolicy::SplitTail,
+        };
+        assert!(policy.split_tail_relocate_for_upstream(Some("official")));
+        assert!(!policy.split_tail_relocate_for_upstream(None));
+        assert!(!policy.split_tail_relocate_for_upstream(Some("eswitch")));
+
+        let off = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+        };
+        assert!(
+            !off.split_tail_relocate_for_upstream(Some("official")),
+            "relocate=off (default) must never activate split-tail"
         );
     }
 
@@ -1208,6 +1360,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         let mut legacy = HashMap::new();
@@ -1232,6 +1385,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1254,6 +1408,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         let mut map = kimi_effort_map();
@@ -1278,6 +1433,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         let mut map = kimi_effort_map();
@@ -1326,6 +1482,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         let json = serde_json::to_string(&pinned).unwrap();
@@ -1358,6 +1515,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: Some("high".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map());
@@ -1380,6 +1538,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: Some("medium".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map());
@@ -1401,6 +1560,7 @@ mod tests {
                 ]),
                 replay: crate::cache::ReplayPolicy::Off,
                 history: crate::cache::HistoryPolicy::Off,
+                relocate: RelocatePolicy::Off,
                 pinned_effort: Some(pin.to_string()),
             };
             policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1435,6 +1595,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map()); // must not panic
@@ -1460,6 +1621,7 @@ mod tests {
             ]),
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: Some("low".to_string()),
         };
         policy.validate_effort_enum("moonshot", &kimi_effort_map_without_low());
@@ -1515,6 +1677,7 @@ mod tests {
             pinned_effort: None,
             replay: ReplayPolicy::FullAssistant,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
         };
         assert!(policy.full_assistant_replay_for_upstream(Some("official")));
         assert!(!policy.full_assistant_replay_for_upstream(Some("eswitch")));
@@ -1524,6 +1687,7 @@ mod tests {
         let off = CachePolicy {
             replay: ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             ..policy.clone()
         };
         assert!(!off.full_assistant_replay_for_upstream(Some("official")));
@@ -1551,6 +1715,7 @@ mod tests {
             pinned_effort: None,
             replay: ReplayPolicy::Off,
             history: HistoryPolicy::AppendOnly,
+            relocate: RelocatePolicy::Off,
         };
         let json = serde_json::to_string(&on).unwrap();
         assert!(
@@ -1563,6 +1728,7 @@ mod tests {
         // Off (the default) is omitted from serialized config.
         let off = CachePolicy {
             history: HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             ..on.clone()
         };
         let json = serde_json::to_string(&off).unwrap();
@@ -1587,6 +1753,7 @@ mod tests {
             pinned_effort: None,
             replay: ReplayPolicy::Off,
             history: HistoryPolicy::AppendOnly,
+            relocate: RelocatePolicy::Off,
         };
         assert!(policy.append_only_history_for_upstream(Some("official")));
         assert!(!policy.append_only_history_for_upstream(Some("eswitch")));
@@ -1595,6 +1762,7 @@ mod tests {
         // Off never opts in, even on the official upstream.
         let off = CachePolicy {
             history: HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             ..policy.clone()
         };
         assert!(!off.append_only_history_for_upstream(Some("official")));
@@ -1705,6 +1873,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         }
     }
@@ -1720,6 +1889,7 @@ mod tests {
                 effort_enum: None,
                 replay: crate::cache::ReplayPolicy::Off,
                 history: crate::cache::HistoryPolicy::Off,
+                relocate: RelocatePolicy::Off,
                 pinned_effort: None,
             })),
             CacheStatsMode::Legacy,
@@ -1762,6 +1932,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         assert_eq!(
@@ -1931,6 +2102,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: RelocatePolicy::Off,
             pinned_effort: None,
         };
         assert_eq!(chat_usage_view(Some(&usage), Some(&off)), view);

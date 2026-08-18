@@ -343,6 +343,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
@@ -376,6 +377,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
@@ -399,6 +401,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, false);
@@ -484,6 +487,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);
@@ -511,6 +515,7 @@ mod tests {
             effort_enum: None,
             replay: crate::cache::ReplayPolicy::Off,
             history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
             pinned_effort: None,
         });
         assert_routes_to("kimi-k3", &config, true);

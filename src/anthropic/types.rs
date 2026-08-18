@@ -24,21 +24,21 @@ pub struct MessagesRequest {
     pub top_k: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum SystemPrompt {
     Text(String),
     Blocks(Vec<SystemContentBlock>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SystemContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: ContentValue,
@@ -54,7 +54,7 @@ enum ContentValueInner {
     Raw(serde_json::Value),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentValue {
     Text(String),
     Blocks(Vec<ContentBlock>),
@@ -90,11 +90,7 @@ impl<'de> Deserialize<'de> for ContentValue {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "response input variants preserve Anthropic protocol fields"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
@@ -123,7 +119,7 @@ pub enum ContentBlock {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
@@ -132,11 +128,7 @@ pub enum ToolResultContent {
 
 /// A single content block inside a tool_result.
 /// Anthropic API supports text and image blocks in tool results.
-#[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "tool result image fields are deserialized for protocol compatibility"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToolResultContentBlock {
     #[serde(rename = "text")]
@@ -148,11 +140,7 @@ pub enum ToolResultContentBlock {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "image source fields are deserialized for protocol compatibility"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
