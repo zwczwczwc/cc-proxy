@@ -505,6 +505,7 @@ mod tests {
     fn raw_policy() -> CachePolicy {
         CachePolicy {
             usage: crate::cache::UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         }

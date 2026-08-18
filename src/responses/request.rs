@@ -344,6 +344,31 @@ mod tests {
     }
 
     #[test]
+    fn responses_request_never_carries_prompt_cache_key() {
+        // Phase 3 P3-C explicit non-goal: the Responses wire must never carry
+        // `prompt_cache_key` (Kimi rides the Chat wire; Responses is only
+        // gpt-5.6-luna). The ResponsesRequest type has no such field — assert
+        // the serialized outbound request omits it even when the inbound
+        // request carries a stable metadata.user_id.
+        let result = serde_json::from_str::<MessagesRequest>(
+            r#"{
+            "model":"gpt-5.6-luna","max_tokens":128,
+            "metadata":{"user_id":"user-42"},
+            "messages":[{"role":"user","content":"hello"}]
+        }"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(
+            convert_request(&result, &crate::test_support::test_config()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            value.get("prompt_cache_key").is_none(),
+            "Responses wire must never carry prompt_cache_key: {value}"
+        );
+    }
+
+    #[test]
     fn responses_uses_provider_max_effort_for_gpt() {
         use crate::config::{Config, ModelProfile, ProviderConfig, WireApi};
         use std::collections::HashMap;

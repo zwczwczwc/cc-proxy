@@ -113,6 +113,24 @@ pub struct CachePolicy {
     /// explicitly declares this capability.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub effort_enum: Option<Vec<String>>,
+    /// Whether this policy opts into injecting a deterministic session
+    /// `prompt_cache_key` on the outbound Chat wire (Phase 3 P3-C).
+    ///
+    /// Default `false`. This is a pure capability flag: activation is gated on
+    /// this explicit opt-in PLUS a stable inbound `metadata.user_id` source
+    /// PLUS an official Moonshot upstream binding (resolved data-driven via
+    /// [`crate::config::Config::effective_upstream_binding`]) — never on a
+    /// provider-name string, and never on `upstream: "official"` alone: a
+    /// legacy `moonshot-official` route that declares no policy keeps sending
+    /// no key. The Responses encoder is an explicit non-goal and never carries
+    /// a key (Kimi rides the Chat wire).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub prompt_cache_key_enabled: bool,
+}
+
+#[inline]
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl CachePolicy {
@@ -189,13 +207,6 @@ impl CachePolicy {
 /// Future inbound sources (e.g. a session-id header set by an ingress) should
 /// extend this module with their own source label so keys stay namespaced by
 /// source channel.
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "fail-closed session key; wired in Phase 3 injection"
-    )
-)]
 pub(crate) fn session_key_from_source(
     source: Option<&str>,
     provider: &str,
@@ -861,6 +872,7 @@ mod tests {
     fn cache_usage_enabled_follows_usage_source() {
         let enabled = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         };
@@ -868,6 +880,7 @@ mod tests {
 
         let binding_only = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
         };
@@ -883,6 +896,10 @@ mod tests {
         let policy: CachePolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(policy.usage, UsagePolicy::Off);
         assert_eq!(policy.upstream, None);
+        assert!(
+            !policy.prompt_cache_key_enabled,
+            "prompt_cache_key capability must default off (P3-C fail-closed)"
+        );
 
         // Unknown fields are ignored (forward-compat with later phases).
         let policy: CachePolicy =
@@ -892,9 +909,31 @@ mod tests {
     }
 
     #[test]
+    fn prompt_cache_key_flag_serde_off_by_default_and_roundtrips_when_on() {
+        // P3-C: the opt-in capability flag serializes only when true (off is
+        // omitted from the wire config), defaults false on missing input, and
+        // round-trips.
+        let on = CachePolicy {
+            usage: UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            prompt_cache_key_enabled: true,
+        };
+        let json = serde_json::to_string(&on).unwrap();
+        assert_eq!(
+            json,
+            r#"{"usage":"off","upstream":"official","prompt_cache_key_enabled":true}"#
+        );
+        let back: CachePolicy = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, on);
+        assert!(back.prompt_cache_key_enabled);
+    }
+
+    #[test]
     fn cache_policy_serde_roundtrip() {
         let policy = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
         };
@@ -924,6 +963,7 @@ mod tests {
         // a no-op and must never panic.
         let policy = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         };
@@ -940,6 +980,7 @@ mod tests {
         // output in the declared set validates cleanly.
         let policy = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: Some(vec![
                 "low".to_string(),
@@ -958,6 +999,7 @@ mod tests {
         // normalized, never coerced.
         let policy = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: Some(vec![
                 "low".to_string(),
@@ -978,6 +1020,7 @@ mod tests {
         // illegal and fails fast.
         let policy = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: Some(vec![
                 "low".to_string(),
@@ -1089,6 +1132,7 @@ mod tests {
     fn raw_policy() -> CachePolicy {
         CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         }
@@ -1100,6 +1144,7 @@ mod tests {
         assert_eq!(
             CacheStatsMode::from_policy(Some(&CachePolicy {
                 usage: UsagePolicy::Off,
+                prompt_cache_key_enabled: false,
                 upstream: None,
                 effort_enum: None,
             })),
@@ -1138,6 +1183,7 @@ mod tests {
         // An explicitly off policy must behave byte-identically to None.
         let off = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         };
@@ -1303,6 +1349,7 @@ mod tests {
         // An explicitly off policy must behave byte-identically to None.
         let off = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         };

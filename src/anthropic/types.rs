@@ -221,11 +221,10 @@ pub enum ToolChoice {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "metadata is deserialized for protocol compatibility"
-)]
 pub struct Metadata {
+    /// Stable per-session identifier. Phase 3 P3-C reads this as the
+    /// inbound source for the deterministic Chat `prompt_cache_key` when the
+    /// provider's cache policy opts in (fail-closed: None/empty ⇒ no key).
     pub user_id: Option<String>,
 }
 

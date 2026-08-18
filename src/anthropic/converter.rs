@@ -184,6 +184,50 @@ pub(crate) fn convert_request_with_relocation(
     sanitize_thinking_mode_messages(&mut body);
     openai_req = serde_json::from_value(body)?;
 
+    // Phase 3 P3-C: policy-gated, fail-closed `prompt_cache_key` injection
+    // (Chat wire only — this is the Anthropic→OpenAI Chat converter; the
+    // Responses encoder is an explicit non-goal and never carries the key).
+    //
+    // Every gate must hold or the key stays absent (fail-closed):
+    //   1. the model's provider declares an explicit
+    //      `cache_policy.prompt_cache_key_enabled = true` opt-in;
+    //   2. the effective upstream binding resolves to `"official"`
+    //      (data-driven via `Config::effective_upstream_binding`, never a
+    //      provider-name string — a legacy `moonshot-official` route that
+    //      declares no policy keeps sending no key);
+    //   3. a stable inbound `MessagesRequest.metadata.user_id` source is
+    //      present and non-empty (None/empty never gets a UUID/time/plaintext
+    //      fallback).
+    // The key itself is a deterministic hash of
+    // `provider[:binding] | model | metadata.user_id | value` via
+    // `cache::session_key_from_source` — stable per source, distinct across
+    // sources, and never contains plaintext.
+    {
+        let profile = config.model_profile(&openai_req.model);
+        let opted_in = profile
+            .and_then(|p| config.provider_config(&p.provider))
+            .and_then(|pc| pc.cache_policy.as_ref())
+            .map(|cp| cp.prompt_cache_key_enabled)
+            .unwrap_or(false);
+        let bound_official = profile.and_then(|p| config.effective_upstream_binding(&p.provider))
+            == Some("official");
+        let source = req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .filter(|s| !s.is_empty());
+        if opted_in && bound_official {
+            if let (Some(source), Some(profile)) = (source, profile) {
+                openai_req.prompt_cache_key = crate::cache::session_key_from_source(
+                    Some(source),
+                    &profile.provider,
+                    &openai_req.model,
+                    Some("official"),
+                );
+            }
+        }
+    }
+
     // F6 (simplified): Per-request prefix fingerprint for KV cache observability.
     // No cross-request comparison — external monitoring aggregates and analyses.
     let sys_prompt = openai_req
@@ -1212,5 +1256,202 @@ mod tests {
             "Reasoning fix should work independently of relocate.\nGot: {:?}",
             reasoning
         );
+    }
+
+    // --- Phase 3 P3-C: policy-gated, fail-closed prompt_cache_key injection ---
+    //
+    // The key is injected ONLY on the Anthropic Chat wire, and only when
+    // every gate holds: an explicit `cache_policy.prompt_cache_key_enabled`
+    // opt-in + an official Moonshot upstream binding (resolved data-driven,
+    // never a provider-name string) + a stable `metadata.user_id` source.
+    // All other shapes — policy off, no official binding, missing/empty
+    // source, legacy moonshot-official with no policy, non-Kimi providers,
+    // and the entire Responses wire — stay key-free (fail-closed).
+
+    fn kimi_optin_config() -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            prompt_cache_key_enabled: true,
+        });
+        config
+    }
+
+    fn kimi_req_with_metadata(user_id: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            model: "kimi-k3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: Some(crate::anthropic::types::Metadata {
+                user_id: user_id.map(|s| s.to_string()),
+            }),
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        }
+    }
+
+    #[test]
+    fn default_policy_keeps_prompt_cache_key_absent_on_wire() {
+        // P3-C fail-closed (policy off): even with a stable metadata.user_id
+        // present, a config that declares no cache policy (the state of every
+        // current config) must NOT inject a key — the outbound body carries
+        // no prompt_cache_key.
+        let config = test_config();
+        let result = convert_request_with_relocation(
+            &kimi_req_with_metadata(Some("user-42")),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "policy-off route must not emit prompt_cache_key: {body}"
+        );
+    }
+
+    #[test]
+    fn optin_official_upstream_with_source_injects_key_full_converter_path() {
+        // Full inbound converter path (not just the helper): a kimi-k3
+        // request through convert_request_with_relocation gains a
+        // prompt_cache_key on the serialized outbound body.
+        let config = kimi_optin_config();
+        let result = convert_request_with_relocation(
+            &kimi_req_with_metadata(Some("user-42")),
+            &config,
+            false,
+        )
+        .unwrap();
+        let key = result
+            .prompt_cache_key
+            .as_deref()
+            .expect("opt-in + stable source + official upstream must inject a key");
+        assert_eq!(key.len(), 32, "key is 16 hash bytes => 32 hex chars");
+        let body = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            body.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some(key)
+        );
+    }
+
+    #[test]
+    fn optin_missing_source_omits_key_fail_closed() {
+        // Missing metadata.user_id (None) or empty — never a UUID / time /
+        // plaintext fallback: the key stays absent.
+        let config = kimi_optin_config();
+        for user_id in [None, Some("")] {
+            let result =
+                convert_request_with_relocation(&kimi_req_with_metadata(user_id), &config, false)
+                    .unwrap();
+            assert_eq!(result.prompt_cache_key, None, "user_id={user_id:?}");
+            let body = serde_json::to_value(&result).unwrap();
+            assert!(body.get("prompt_cache_key").is_none());
+        }
+    }
+
+    #[test]
+    fn different_sources_yield_different_keys() {
+        let config = kimi_optin_config();
+        let a = convert_request(&kimi_req_with_metadata(Some("user-a")), &config).unwrap();
+        let b = convert_request(&kimi_req_with_metadata(Some("user-b")), &config).unwrap();
+        assert_ne!(
+            a.prompt_cache_key.expect("injected"),
+            b.prompt_cache_key.expect("injected")
+        );
+    }
+
+    #[test]
+    fn same_source_yields_byte_equal_key_across_calls() {
+        let config = kimi_optin_config();
+        let k1 = convert_request(&kimi_req_with_metadata(Some("user-same")), &config)
+            .unwrap()
+            .prompt_cache_key
+            .expect("injected");
+        let k2 = convert_request(&kimi_req_with_metadata(Some("user-same")), &config)
+            .unwrap()
+            .prompt_cache_key
+            .expect("injected");
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn injected_key_is_hashed_hex_and_never_contains_plaintext() {
+        let secret = "tok-abcdef-12345";
+        let config = kimi_optin_config();
+        let result = convert_request(&kimi_req_with_metadata(Some(secret)), &config).unwrap();
+        let key = result.prompt_cache_key.expect("injected");
+        assert!(
+            !key.contains(secret),
+            "plaintext must never leak into the key"
+        );
+        assert_eq!(key.len(), 32, "16 hash bytes => 32 hex chars");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "key is hex");
+        assert_eq!(key, key.to_lowercase(), "hex digest is lowercase");
+    }
+
+    #[test]
+    fn optin_without_official_binding_does_not_inject() {
+        // Canonical "moonshot" with prompt_cache_key_enabled but NO upstream
+        // binding: effective binding is None (canonical name has no alias
+        // default) -> fail-closed, no key. Activation is never implied by
+        // the flag alone.
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            prompt_cache_key_enabled: true,
+        });
+        let result = convert_request(&kimi_req_with_metadata(Some("user-42")), &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn legacy_moonshot_official_without_policy_does_not_inject() {
+        // A config that names its provider "moonshot-official" (legacy alias)
+        // and declares NO cache policy stays key-free even though its
+        // effective upstream binding resolves to "official" via the alias
+        // default. No provider-string coupling: injection needs the explicit
+        // prompt_cache_key_enabled opt-in.
+        let mut config = test_config();
+        let legacy = config.providers.get_mut("moonshot").unwrap().clone();
+        config
+            .providers
+            .insert("moonshot-official".to_string(), legacy);
+        let idx = *config.profile_by_name.get("kimi-k3").expect("kimi profile");
+        config.model_profiles[idx].provider = "moonshot-official".to_string();
+        let result = convert_request(&kimi_req_with_metadata(Some("user-42")), &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn non_kimi_provider_never_injected_even_with_source() {
+        // Non-moonshot providers are untouched: a deepseek request with a
+        // metadata.user_id still produces no prompt_cache_key.
+        let config = test_config();
+        let mut req = kimi_req_with_metadata(Some("user-42"));
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
     }
 }

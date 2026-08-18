@@ -990,6 +990,7 @@ max = "max"
                 responses_reasoning_summary: None,
                 cache_policy: Some(CachePolicy {
                     usage: UsagePolicy::TopLevelCachedTokens,
+                    prompt_cache_key_enabled: false,
                     upstream: Some("not-a-real-upstream".to_string()),
                     effort_enum: None,
                 }),
@@ -1071,6 +1072,7 @@ max = "max"
                 responses_reasoning_summary: None,
                 cache_policy: Some(CachePolicy {
                     usage: UsagePolicy::Off,
+                    prompt_cache_key_enabled: false,
                     upstream: Some("official".to_string()),
                     effort_enum: None,
                 }),
@@ -1365,6 +1367,7 @@ max = "max"
         // stay inside the set validates cleanly at startup.
         let policy = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: Some(kimi_effort_enum()),
         };
@@ -1381,6 +1384,7 @@ max = "max"
         // current config.toml would hit if it ever declared effort_enum).
         let policy = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: Some(kimi_effort_enum()),
         };
@@ -1395,6 +1399,7 @@ max = "max"
         // output under the Kimi enum is illegal and fails fast.
         let policy = CachePolicy {
             usage: UsagePolicy::TopLevelCachedTokens,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: Some(kimi_effort_enum()),
         };
@@ -1409,6 +1414,7 @@ max = "max"
         // stays valid. Non-opt-in and default-off profiles are unchanged.
         let policy = CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         };

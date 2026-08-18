@@ -338,6 +338,7 @@ mod tests {
             .expect("canonical moonshot provider exists in test_config");
         moonshot.cache_policy = Some(CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
         });
@@ -367,6 +368,7 @@ mod tests {
             .expect("canonical moonshot provider exists in test_config");
         moonshot.cache_policy = Some(CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
         });
@@ -386,6 +388,7 @@ mod tests {
             .expect("canonical moonshot provider exists in test_config");
         moonshot.cache_policy = Some(CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: Some("eswitch".to_string()),
             effort_enum: None,
         });
@@ -467,6 +470,7 @@ mod tests {
             .expect("legacy block exists in live_shape_config");
         legacy.cache_policy = Some(CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: Some("official".to_string()),
             effort_enum: None,
         });
@@ -490,6 +494,7 @@ mod tests {
             .expect("legacy block exists in live_shape_config");
         legacy.cache_policy = Some(CachePolicy {
             usage: UsagePolicy::Off,
+            prompt_cache_key_enabled: false,
             upstream: None,
             effort_enum: None,
         });
