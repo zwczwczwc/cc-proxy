@@ -173,17 +173,34 @@ pub enum ThinkingConfig {
 }
 
 impl ThinkingConfig {
+    /// Semantic check driven by the wire `type` string, NOT the untagged variant.
+    ///
+    /// `ThinkingConfig` is `#[serde(untagged)]` with `Enabled` declared first and
+    /// every field optional, so serde deserializes ANY thinking object — including
+    /// `{"type":"disabled"}` — into the `Enabled` variant. The variant is therefore
+    /// not a reliable signal: `{"type":"disabled"}` used to be treated as enabled,
+    /// which sent `reasoning_effort=high` upstream instead of turning thinking off.
+    /// The `config_type` string is the source of truth.
     pub fn is_enabled(&self) -> bool {
-        matches!(
-            self,
-            ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }
-        )
+        matches!(self.type_str(), "enabled" | "adaptive")
+    }
+
+    /// Wire type string (identical across all untagged variants).
+    pub fn type_str(&self) -> &str {
+        match self {
+            ThinkingConfig::Enabled { config_type, .. } => config_type,
+            ThinkingConfig::Disabled { config_type } => config_type,
+            ThinkingConfig::Adaptive { config_type, .. } => config_type,
+        }
     }
 
     pub fn budget_tokens(&self) -> Option<u32> {
         match self {
-            ThinkingConfig::Enabled { budget_tokens, .. } => *budget_tokens,
-            ThinkingConfig::Adaptive { .. } => None,
+            ThinkingConfig::Enabled {
+                config_type,
+                budget_tokens,
+                ..
+            } if config_type == "enabled" => *budget_tokens,
             _ => None,
         }
     }
@@ -350,4 +367,41 @@ pub struct StreamUsage {
     pub cache_read_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `{"type":"disabled"}` must NOT be treated as enabled.
+    ///
+    /// `ThinkingConfig` is `#[serde(untagged)]` with `Enabled` declared first and all
+    /// fields optional, so serde deserializes the JSON into the `Enabled` variant even
+    /// for `disabled`/`adaptive` type strings. `is_enabled()` must therefore read the
+    /// wire `type` string, not the untagged variant (b01860f bug: disabled requests
+    /// were sent upstream with `reasoning_effort=high` instead of `low`).
+    #[test]
+    fn disabled_type_string_is_not_enabled() {
+        let parsed: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"disabled"}"#).expect("deserialize disabled");
+        assert!(!parsed.is_enabled());
+        assert_eq!(parsed.type_str(), "disabled");
+    }
+
+    #[test]
+    fn enabled_type_string_is_enabled() {
+        let parsed: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"enabled","budget_tokens":4096}"#)
+                .expect("deserialize enabled");
+        assert!(parsed.is_enabled());
+        assert_eq!(parsed.budget_tokens(), Some(4096));
+    }
+
+    #[test]
+    fn adaptive_type_string_is_enabled() {
+        let parsed: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"adaptive"}"#).expect("deserialize adaptive");
+        assert!(parsed.is_enabled());
+        assert_eq!(parsed.budget_tokens(), None);
+    }
 }
