@@ -34,6 +34,7 @@ mod tests {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
 
@@ -67,7 +68,7 @@ mod tests {
             },
             crate::config::ModelProfile {
                 name: "kimi-k3".to_string(),
-                provider: "fireworks".to_string(),
+                provider: "moonshot".to_string(),
                 reasoning_enabled: true,
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,

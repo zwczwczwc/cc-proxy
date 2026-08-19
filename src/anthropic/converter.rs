@@ -35,6 +35,20 @@ pub fn convert_request(
     req: &MessagesRequest,
     config: &Config,
 ) -> anyhow::Result<ChatCompletionRequest> {
+    let relocate = std::env::var("CODEMERMAFROST_RELOCATE").is_ok();
+    convert_request_with_relocation(req, config, relocate)
+}
+
+/// Same as [`convert_request`] with an explicit relocate decision.
+///
+/// Zero behavior change: [`convert_request`] passes the process-level
+/// `CODEMERMAFROST_RELOCATE` flag here. Tests use this variant to capture and
+/// verify both relocate states deterministically (no process-global env races).
+pub(crate) fn convert_request_with_relocation(
+    req: &MessagesRequest,
+    config: &Config,
+    relocate: bool,
+) -> anyhow::Result<ChatCompletionRequest> {
     let model = req.model.clone();
     // Map Claude model names to upstream model names for eswitch
     let upstream_model = map_model_to_upstream(&model, config);
@@ -59,11 +73,114 @@ pub fn convert_request(
         config,
     );
 
+    // Phase 4b (T06/T07): policy-gated full assistant-history replay.
+    //
+    // `include_reasoning` above is the LEGACY gate: it is decided by the
+    // CURRENT request's thinking/effort, so a stored assistant message's
+    // reasoning_content flips as the client varies its thinking budget —
+    // rewriting history and busting the upstream prefix cache from that
+    // message onwards. `replay_full` opts an explicit
+    // `cache_policy.replay = "full_assistant"` official-upstream route into
+    // replaying stored assistant reasoning/text/tool_calls in full,
+    // independent of the current request — the direct precedent is
+    // `raine/claude-code-proxy::push_assistant_message`'s unconditional
+    // replay (report 34 K2). The gate is resolved data-driven via
+    // `effective_upstream_binding` (never a provider-name string, G7), and
+    // it governs HISTORY REPLAY ONLY: the current request's own output
+    // control (`thinking.type` / `reasoning_effort`, set later via
+    // `apply_effort_direct`) is never changed or resurrected by it.
+    let replay_full = config
+        .model_profile(&upstream_model)
+        .and_then(|p| {
+            let binding = config.effective_upstream_binding(&p.provider);
+            config
+                .provider_config(&p.provider)
+                .and_then(|pc| pc.cache_policy.as_ref())
+                .map(|cp| cp.full_assistant_replay_for_upstream(binding))
+        })
+        .unwrap_or(false);
+    // Effective assistant-history replay gate: full replay overrides the
+    // legacy per-request gate when the policy opts in; otherwise the legacy
+    // behavior is preserved byte-for-byte.
+    let assistant_replay = replay_full || include_reasoning;
+
+    // Phase 4c: policy-gated append-only stored-history preservation.
+    //
+    // The legacy chat encoder rewrites already-provided history on the wire:
+    // `cleanup_orphan_tool_calls` strips orphaned `tool_calls` from
+    // non-final assistant messages, `compact_tool_result` truncates
+    // oversized `tool_result` bodies, and the P1-3 dedup drops repeated
+    // results for the same `tool_call_id`. Each rewrite mutates a stored
+    // message and busts the upstream prefix cache from that message onwards.
+    // `append_only` opts an explicit `cache_policy.history = "append_only"`
+    // official-upstream route into preserving that history byte-for-byte
+    // (order, tool IDs, content bytes). The gate is resolved data-driven via
+    // `effective_upstream_binding` (never a provider-name string, G7), and
+    // it governs STORED-HISTORY PRESERVATION ONLY: assistant reasoning
+    // replay (`replay_full`, Phase 4b) and the current request's own output
+    // control (`thinking.type` / `reasoning_effort`) are never touched by it.
+    let append_only = config
+        .model_profile(&upstream_model)
+        .and_then(|p| {
+            let binding = config.effective_upstream_binding(&p.provider);
+            config
+                .provider_config(&p.provider)
+                .and_then(|pc| pc.cache_policy.as_ref())
+                .map(|cp| cp.append_only_history_for_upstream(binding))
+        })
+        .unwrap_or(false);
+
+    // Phase 4d: policy-gated split-tail relocation of volatile system blocks.
+    //
+    // `cache_policy.relocate = "split_tail"` opts an explicit
+    // official-upstream route into splitting volatile env blocks out of the
+    // cache-prefix-sensitive system position and relocating them to a
+    // deterministic conversation tail WITHOUT rewriting already-constructed
+    // stable history. The gate is resolved data-driven via
+    // `effective_upstream_binding` (never a provider-name string, G7), and it
+    // governs SYSTEM-PROMPT RELOCATION ONLY: assistant reasoning replay
+    // (`replay_full`/`include_reasoning`, Phase 4b), stored-history
+    // preservation (`append_only`, Phase 4c) and current-request output
+    // control are never touched by it. Every non-opt-in route — policy off,
+    // no official binding, non-Kimi providers — keeps the legacy env-driven
+    // `CODEMERMAFROST_RELOCATE` path byte-for-byte (fail-closed).
+    let split_tail = config
+        .model_profile(&upstream_model)
+        .and_then(|p| {
+            let binding = config.effective_upstream_binding(&p.provider);
+            config
+                .provider_config(&p.provider)
+                .and_then(|pc| pc.cache_policy.as_ref())
+                .map(|cp| cp.split_tail_relocate_for_upstream(binding))
+        })
+        .unwrap_or(false);
+
     // Build OpenAI messages
-    // Feature flag: relocate volatile env blocks from system prefix to last user turn
-    // to stabilise KV cache prefix across turns.
-    // Controlled by env var CODEMERMAFROST_RELOCATE.
-    let (system, messages_ref) = if std::env::var("CODEMERMAFROST_RELOCATE").is_ok() {
+    // Phase 4d split-tail: policy-gated relocation of volatile env blocks
+    // from the system prefix to a deterministic conversation tail, without
+    // rewriting stable history (official Kimi upstream only).
+    // Legacy: env var CODEMERMAFROST_RELOCATE controls the migrate path.
+    let (system, messages_ref) = if split_tail {
+        let raw_system = req
+            .system
+            .clone()
+            .unwrap_or(SystemPrompt::Text(String::new()));
+        // Step 1: stabilize billing nonce (permafrost_align.py L149-L177)
+        let system = crate::reasoning::relocate::stabilize_metadata(raw_system);
+        // Step 2: split volatile env blocks to the conversation tail
+        // (no mutation of already-constructed stable history).
+        let (new_system, new_messages) = crate::reasoning::relocate::relocate_volatile_to_chat_tail(
+            system,
+            req.messages.clone(),
+        );
+        let messages = new_messages;
+        let system_opt = if matches!(new_system, SystemPrompt::Text(ref t) if t.is_empty()) {
+            None
+        } else {
+            Some(new_system)
+        };
+        (system_opt, messages)
+    } else if relocate {
         let raw_system = req
             .system
             .clone()
@@ -86,8 +203,12 @@ pub fn convert_request(
     } else {
         (req.system.clone(), req.messages.clone())
     };
-    let messages =
-        build_chat_messages_with_reasoning(system.as_ref(), &messages_ref, include_reasoning);
+    let messages = build_chat_messages_with_reasoning(
+        system.as_ref(),
+        &messages_ref,
+        assistant_replay,
+        append_only,
+    );
 
     let stream = req.stream.unwrap_or(false);
 
@@ -111,12 +232,15 @@ pub fn convert_request(
         tools: None,
         tool_choice: None,
         stop: None,
+        // Phase 2b.2: field only, always None (default). Injection of a
+        // derived session key is Phase 3 behavior — never set here.
+        prompt_cache_key: None,
     };
 
     // Convert tools (sorted by name for KV cache prefix stability)
     if let Some(tools) = &req.tools {
         let mut openai_tools: Vec<OpenAiTool> = tools.iter().map(convert_tool).collect();
-        openai_tools.sort_by(|a, b| a.function.name.cmp(&b.function.name));
+        crate::conversation::sort_by_name(&mut openai_tools, |t| &t.function.name);
         openai_req.tools = Some(openai_tools);
     }
 
@@ -131,10 +255,38 @@ pub fn convert_request(
     let is_gpt_provider = profile.map(|p| p.provider == "gpt").unwrap_or(false);
     let has_tools = openai_req.tools.is_some();
 
+    // Phase 4a (T13): explicit, stateless Kimi reasoning-effort pin.
+    //
+    // `CachePolicy.pinned_effort` (default `None`) opts a provider into a
+    // fixed wire effort. When declared AND the provider's effective upstream
+    // binding resolves to the canonical `"official"` (Kimi For Coding)
+    // upstream, the effort applied below is the pinned value instead of the
+    // per-request `thinking.budget_tokens`-derived default — so a session's
+    // reasoning_effort never flips as the client varies its thinking budget
+    // between requests.
+    //
+    // The pin is a static config value, NOT a value captured from "the first
+    // request" and remembered: true per-session derivation would require
+    // implicit server-side session state, which this codebase deliberately
+    // avoids (documented on `CachePolicy::pinned_effort`). Because the pin is
+    // explicit in config it is deterministic across calls, restarts and
+    // sessions by construction, and the dynamic path stays byte-for-byte
+    // intact for every non-opt-in route (fail-closed). The gate is resolved
+    // data-driven via `effective_upstream_binding` — never a provider-name
+    // string (G7).
+    let pinned_effort = profile.and_then(|p| {
+        let binding = config.effective_upstream_binding(&p.provider);
+        config
+            .provider_config(&p.provider)
+            .and_then(|pc| pc.cache_policy.as_ref())
+            .and_then(|cp| cp.pinned_effort_for_upstream(binding))
+    });
+
     if let Some(thinking) = &req.thinking {
         if thinking.is_enabled() {
-            // Default all thinking-enabled requests to xhigh effort.
-            let effort = "xhigh";
+            // Default all thinking-enabled requests to xhigh effort, unless an
+            // explicit Phase 4a pin overrides it (Kimi official only).
+            let effort = pinned_effort.unwrap_or("xhigh");
             let effort = if is_gpt_provider && has_tools {
                 "off"
             } else {
@@ -148,7 +300,7 @@ pub fn convert_request(
         let effort = if is_gpt_provider && has_tools {
             "off"
         } else {
-            "xhigh"
+            pinned_effort.unwrap_or("xhigh")
         };
         apply_effort_direct(&mut openai_req, effort, config);
     }
@@ -166,6 +318,50 @@ pub fn convert_request(
     let mut body = serde_json::to_value(&openai_req)?;
     sanitize_thinking_mode_messages(&mut body);
     openai_req = serde_json::from_value(body)?;
+
+    // Phase 3 P3-C: policy-gated, fail-closed `prompt_cache_key` injection
+    // (Chat wire only — this is the Anthropic→OpenAI Chat converter; the
+    // Responses encoder is an explicit non-goal and never carries the key).
+    //
+    // Every gate must hold or the key stays absent (fail-closed):
+    //   1. the model's provider declares an explicit
+    //      `cache_policy.prompt_cache_key_enabled = true` opt-in;
+    //   2. the effective upstream binding resolves to `"official"`
+    //      (data-driven via `Config::effective_upstream_binding`, never a
+    //      provider-name string — a legacy `moonshot-official` route that
+    //      declares no policy keeps sending no key);
+    //   3. a stable inbound `MessagesRequest.metadata.user_id` source is
+    //      present and non-empty (None/empty never gets a UUID/time/plaintext
+    //      fallback).
+    // The key itself is a deterministic hash of
+    // `provider[:binding] | model | metadata.user_id | value` via
+    // `cache::session_key_from_source` — stable per source, distinct across
+    // sources, and never contains plaintext.
+    {
+        let profile = config.model_profile(&openai_req.model);
+        let opted_in = profile
+            .and_then(|p| config.provider_config(&p.provider))
+            .and_then(|pc| pc.cache_policy.as_ref())
+            .map(|cp| cp.prompt_cache_key_enabled)
+            .unwrap_or(false);
+        let bound_official = profile.and_then(|p| config.effective_upstream_binding(&p.provider))
+            == Some("official");
+        let source = req
+            .metadata
+            .as_ref()
+            .and_then(|m| m.user_id.as_deref())
+            .filter(|s| !s.is_empty());
+        if opted_in && bound_official {
+            if let (Some(source), Some(profile)) = (source, profile) {
+                openai_req.prompt_cache_key = crate::cache::session_key_from_source(
+                    Some(source),
+                    &profile.provider,
+                    &openai_req.model,
+                    Some("official"),
+                );
+            }
+        }
+    }
 
     // F6 (simplified): Per-request prefix fingerprint for KV cache observability.
     // No cross-request comparison — external monitoring aggregates and analyses.
@@ -321,10 +517,11 @@ mod tests {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
         providers.insert(
-            "fireworks".to_string(),
+            "moonshot".to_string(),
             ProviderConfig {
                 reasoning_field: "reasoning".to_string(),
                 reasoning_field_alt: vec![],
@@ -343,6 +540,7 @@ mod tests {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
         providers.insert(
@@ -367,6 +565,7 @@ mod tests {
                     m
                 },
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
 
@@ -391,7 +590,7 @@ mod tests {
             },
             crate::config::ModelProfile {
                 name: "kimi-k3".to_string(),
-                provider: "fireworks".to_string(),
+                provider: "moonshot".to_string(),
                 reasoning_enabled: true,
                 reasoning_replay: true,
                 toolcall_requires_reasoning: false,
@@ -1192,5 +1391,1264 @@ mod tests {
             "Reasoning fix should work independently of relocate.\nGot: {:?}",
             reasoning
         );
+    }
+
+    // --- Phase 3 P3-C: policy-gated, fail-closed prompt_cache_key injection ---
+    //
+    // The key is injected ONLY on the Anthropic Chat wire, and only when
+    // every gate holds: an explicit `cache_policy.prompt_cache_key_enabled`
+    // opt-in + an official Moonshot upstream binding (resolved data-driven,
+    // never a provider-name string) + a stable `metadata.user_id` source.
+    // All other shapes — policy off, no official binding, missing/empty
+    // source, legacy moonshot-official with no policy, non-Kimi providers,
+    // and the entire Responses wire — stay key-free (fail-closed).
+
+    fn kimi_optin_config() -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: true,
+        });
+        config
+    }
+
+    fn kimi_req_with_metadata(user_id: Option<&str>) -> MessagesRequest {
+        MessagesRequest {
+            model: "kimi-k3".to_string(),
+            system: None,
+            messages: vec![Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("hello".to_string()),
+            }],
+            max_tokens: 4096,
+            stream: Some(false),
+            thinking: None,
+            tools: None,
+            tool_choice: None,
+            metadata: Some(crate::anthropic::types::Metadata {
+                user_id: user_id.map(|s| s.to_string()),
+            }),
+            stop_sequences: None,
+            temperature: None,
+            top_p: None,
+            top_k: None,
+        }
+    }
+
+    #[test]
+    fn default_policy_keeps_prompt_cache_key_absent_on_wire() {
+        // P3-C fail-closed (policy off): even with a stable metadata.user_id
+        // present, a config that declares no cache policy (the state of every
+        // current config) must NOT inject a key — the outbound body carries
+        // no prompt_cache_key.
+        let config = test_config();
+        let result = convert_request_with_relocation(
+            &kimi_req_with_metadata(Some("user-42")),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(
+            body.get("prompt_cache_key").is_none(),
+            "policy-off route must not emit prompt_cache_key: {body}"
+        );
+    }
+
+    #[test]
+    fn optin_official_upstream_with_source_injects_key_full_converter_path() {
+        // Full inbound converter path (not just the helper): a kimi-k3
+        // request through convert_request_with_relocation gains a
+        // prompt_cache_key on the serialized outbound body.
+        let config = kimi_optin_config();
+        let result = convert_request_with_relocation(
+            &kimi_req_with_metadata(Some("user-42")),
+            &config,
+            false,
+        )
+        .unwrap();
+        let key = result
+            .prompt_cache_key
+            .as_deref()
+            .expect("opt-in + stable source + official upstream must inject a key");
+        assert_eq!(key.len(), 32, "key is 16 hash bytes => 32 hex chars");
+        let body = serde_json::to_value(&result).unwrap();
+        assert_eq!(
+            body.get("prompt_cache_key").and_then(|v| v.as_str()),
+            Some(key)
+        );
+    }
+
+    #[test]
+    fn optin_missing_source_omits_key_fail_closed() {
+        // Missing metadata.user_id (None) or empty — never a UUID / time /
+        // plaintext fallback: the key stays absent.
+        let config = kimi_optin_config();
+        for user_id in [None, Some("")] {
+            let result =
+                convert_request_with_relocation(&kimi_req_with_metadata(user_id), &config, false)
+                    .unwrap();
+            assert_eq!(result.prompt_cache_key, None, "user_id={user_id:?}");
+            let body = serde_json::to_value(&result).unwrap();
+            assert!(body.get("prompt_cache_key").is_none());
+        }
+    }
+
+    #[test]
+    fn different_sources_yield_different_keys() {
+        let config = kimi_optin_config();
+        let a = convert_request(&kimi_req_with_metadata(Some("user-a")), &config).unwrap();
+        let b = convert_request(&kimi_req_with_metadata(Some("user-b")), &config).unwrap();
+        assert_ne!(
+            a.prompt_cache_key.expect("injected"),
+            b.prompt_cache_key.expect("injected")
+        );
+    }
+
+    #[test]
+    fn same_source_yields_byte_equal_key_across_calls() {
+        let config = kimi_optin_config();
+        let k1 = convert_request(&kimi_req_with_metadata(Some("user-same")), &config)
+            .unwrap()
+            .prompt_cache_key
+            .expect("injected");
+        let k2 = convert_request(&kimi_req_with_metadata(Some("user-same")), &config)
+            .unwrap()
+            .prompt_cache_key
+            .expect("injected");
+        assert_eq!(k1, k2);
+    }
+
+    #[test]
+    fn injected_key_is_hashed_hex_and_never_contains_plaintext() {
+        let secret = "tok-abcdef-12345";
+        let config = kimi_optin_config();
+        let result = convert_request(&kimi_req_with_metadata(Some(secret)), &config).unwrap();
+        let key = result.prompt_cache_key.expect("injected");
+        assert!(
+            !key.contains(secret),
+            "plaintext must never leak into the key"
+        );
+        assert_eq!(key.len(), 32, "16 hash bytes => 32 hex chars");
+        assert!(key.chars().all(|c| c.is_ascii_hexdigit()), "key is hex");
+        assert_eq!(key, key.to_lowercase(), "hex digest is lowercase");
+    }
+
+    #[test]
+    fn optin_without_official_binding_does_not_inject() {
+        // Canonical "moonshot" with prompt_cache_key_enabled but NO upstream
+        // binding: effective binding is None (canonical name has no alias
+        // default) -> fail-closed, no key. Activation is never implied by
+        // the flag alone.
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: true,
+        });
+        let result = convert_request(&kimi_req_with_metadata(Some("user-42")), &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn legacy_moonshot_official_without_policy_does_not_inject() {
+        // A config that names its provider "moonshot-official" (legacy alias)
+        // and declares NO cache policy stays key-free even though its
+        // effective upstream binding resolves to "official" via the alias
+        // default. No provider-string coupling: injection needs the explicit
+        // prompt_cache_key_enabled opt-in.
+        let mut config = test_config();
+        let legacy = config.providers.get_mut("moonshot").unwrap().clone();
+        config
+            .providers
+            .insert("moonshot-official".to_string(), legacy);
+        let idx = *config.profile_by_name.get("kimi-k3").expect("kimi profile");
+        config.model_profiles[idx].provider = "moonshot-official".to_string();
+        let result = convert_request(&kimi_req_with_metadata(Some("user-42")), &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn non_kimi_provider_never_injected_even_with_source() {
+        // Non-moonshot providers are untouched: a deepseek request with a
+        // metadata.user_id still produces no prompt_cache_key.
+        let config = test_config();
+        let mut req = kimi_req_with_metadata(Some("user-42"));
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request(&req, &config).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4a: deterministic Kimi reasoning-effort pin (T13) ---
+
+    /// Config with the canonical `moonshot` provider bound to the official
+    /// upstream, declaring an explicit Kimi effort enum and an optional pin.
+    fn kimi_pinned_config(pin: Option<&str>) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
+            pinned_effort: pin.map(|s| s.to_string()),
+            prompt_cache_key_enabled: false,
+        });
+        config
+    }
+
+    /// kimi-k3 request with `thinking.enabled` at a given budget; `None`
+    /// budget means no thinking config at all (the common Claude path).
+    fn kimi_req_with_thinking_budget(budget: Option<u32>) -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.thinking = budget.map(|b| ThinkingConfig::Enabled {
+            config_type: "enabled".to_string(),
+            budget_tokens: Some(b),
+            display: None,
+        });
+        req
+    }
+
+    #[test]
+    fn pinned_effort_low_is_stable_across_thinking_budgets() {
+        // T13: a pinned `low` effort must be byte-stable across a wide range
+        // of thinking budgets (jitter) — the wire effort never flips.
+        let config = kimi_pinned_config(Some("low"));
+        for budget in [0, 512, 4095, 4096, 16000, 32768] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("low"),
+                "pinned low must not flip with budget={budget}"
+            );
+            assert!(result.thinking.is_none(), "Kimi K3 has no thinking.type");
+        }
+        // No thinking config at all stays pinned too.
+        let result =
+            convert_request_with_relocation(&kimi_req_with_thinking_budget(None), &config, false)
+                .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn pinned_effort_high_is_stable_across_thinking_budgets() {
+        let config = kimi_pinned_config(Some("high"));
+        for budget in [0, 512, 4095, 16000, 32768] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("high"),
+                "pinned high must not flip with budget={budget}"
+            );
+        }
+        let result =
+            convert_request_with_relocation(&kimi_req_with_thinking_budget(None), &config, false)
+                .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("high"));
+    }
+
+    #[test]
+    fn pinned_effort_max_is_stable_across_thinking_budgets() {
+        let config = kimi_pinned_config(Some("max"));
+        for budget in [0, 512, 4095, 16000, 32768] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("max"),
+                "pinned max must not flip with budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_pinned_effort_keeps_dynamic_derivation() {
+        // Fail-closed: official binding WITHOUT an explicit pin leaves the
+        // existing dynamic derivation byte-for-byte intact (thinking-enabled
+        // kimi → xhigh → max, exactly as before Phase 4a).
+        let config = kimi_pinned_config(None);
+        for budget in [512, 16000] {
+            let result = convert_request_with_relocation(
+                &kimi_req_with_thinking_budget(Some(budget)),
+                &config,
+                false,
+            )
+            .unwrap();
+            assert_eq!(
+                result.reasoning_effort.as_deref(),
+                Some("max"),
+                "no pin => dynamic derivation preserved for budget={budget}"
+            );
+        }
+    }
+
+    #[test]
+    fn optout_policy_preserves_dynamic_derivation() {
+        // An explicitly present policy that does NOT declare a pin (the P3-C
+        // key opt-in shape) keeps dynamic effort — a pin is never implied by
+        // the presence of a cache_policy block.
+        let config = kimi_optin_config(); // prompt_cache_key_enabled, no pin
+        let result = convert_request_with_relocation(
+            &kimi_req_with_thinking_budget(Some(16000)),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn pinned_effort_without_official_binding_does_not_pin() {
+        // Fail-closed: a pin declared without the canonical "official"
+        // upstream binding is not applied. The gate is data-driven (no
+        // provider-name string, G7).
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
+            pinned_effort: Some("high".to_string()),
+            prompt_cache_key_enabled: false,
+        });
+        let result = convert_request_with_relocation(
+            &kimi_req_with_thinking_budget(Some(16000)),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            result.reasoning_effort.as_deref(),
+            Some("max"),
+            "no official binding => pin must not apply"
+        );
+    }
+
+    #[test]
+    fn pinned_effort_does_not_apply_to_non_moonshot_providers() {
+        // Non-moonshot providers (no policy, no official binding) are
+        // untouched: a deepseek request still derives effort dynamically.
+        let config = test_config();
+        let mut req = kimi_req_with_thinking_budget(Some(16000));
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert_eq!(result.reasoning_effort.as_deref(), Some("max"));
+    }
+
+    #[test]
+    fn pinned_effort_does_not_change_prompt_cache_key_behavior() {
+        // Phase 4a is effort-only: enabling a pin WITHOUT the P3-C key opt-in
+        // must not inject a prompt_cache_key (no key changes), even with a
+        // stable metadata.user_id present.
+        let config = kimi_pinned_config(Some("high"));
+        let result = convert_request_with_relocation(
+            &kimi_req_with_metadata(Some("user-42")),
+            &config,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4a remediation (S2): explicit disabled thinking wins over pin ---
+
+    /// kimi-k3 request with `thinking` explicitly DISABLED (the client asked
+    /// for no reasoning at all).
+    fn kimi_req_with_thinking_disabled() -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.thinking = Some(ThinkingConfig::Disabled {
+            config_type: "disabled".to_string(),
+        });
+        req
+    }
+
+    #[test]
+    fn pinned_effort_with_explicit_disabled_thinking_stays_disabled() {
+        // S2: a declared pin must NOT resurrect reasoning when the client
+        // explicitly disabled thinking. The converter's disabled branch
+        // (converter.rs `else` → apply_effort_direct("off")) runs regardless
+        // of the pin — for Kimi (disable_thinking=true) that maps to the
+        // lowest effort with no thinking.type, never the pinned effort.
+        let config = kimi_pinned_config(Some("high"));
+        let result =
+            convert_request_with_relocation(&kimi_req_with_thinking_disabled(), &config, false)
+                .unwrap();
+        // Kimi can't turn off thinking entirely; disabled => lowest effort.
+        assert_eq!(
+            result.reasoning_effort.as_deref(),
+            Some("low"),
+            "explicit disabled thinking must NOT be pinned to high"
+        );
+        assert!(result.thinking.is_none(), "Kimi K3 has no thinking.type");
+    }
+
+    // --- Phase 4b: policy-gated full assistant-history replay (T06/T07) ---
+    //
+    // The legacy gate (`include_reasoning` in `should_replay_reasoning_content`)
+    // is decided by the CURRENT request's thinking/effort, so a stored
+    // assistant message's reasoning_content flips as the client varies its
+    // thinking budget — rewriting history and busting the upstream prefix
+    // cache from that message onwards. With `cache_policy.replay =
+    // "full_assistant"` + the canonical official upstream (data-driven, G7),
+    // stored assistant reasoning/text/tool_calls must be replayed in full,
+    // independent of the current request. Current-request OUTPUT control
+    // (thinking.type / reasoning_effort) is never changed or resurrected.
+
+    /// Config with the canonical `moonshot` provider bound to the official
+    /// upstream, declaring the Kimi effort enum and a given replay policy.
+    fn kimi_replay_config(replay: crate::cache::ReplayPolicy) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
+        });
+        config
+    }
+
+    /// kimi-k3 request whose history contains the given stored assistant
+    /// parts followed by a user turn, sent under the given current thinking
+    /// config.
+    fn kimi_history_req(
+        thinking: Option<ThinkingConfig>,
+        parts: Vec<ContentBlock>,
+    ) -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(parts),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("Next question".to_string()),
+            },
+        ];
+        req.thinking = thinking;
+        req
+    }
+
+    fn thinking_disabled() -> ThinkingConfig {
+        ThinkingConfig::Disabled {
+            config_type: "disabled".to_string(),
+        }
+    }
+
+    fn thinking_enabled(budget: u32) -> ThinkingConfig {
+        ThinkingConfig::Enabled {
+            config_type: "enabled".to_string(),
+            budget_tokens: Some(budget),
+            display: None,
+        }
+    }
+
+    fn asst_msg(messages: &[Value]) -> &Value {
+        messages
+            .iter()
+            .find(|m| m.get("role").and_then(|v| v.as_str()) == Some("assistant"))
+            .expect("history contains an assistant message")
+    }
+
+    #[test]
+    fn replay_off_keeps_legacy_current_effort_gating() {
+        // Golden policy-off baseline: `replay = off` (the default) preserves
+        // the legacy gate byte-for-byte — with the current request's thinking
+        // disabled, stored historical reasoning is NOT replayed, even on the
+        // official Kimi upstream.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::Off);
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me think about this.".to_string(),
+                    signature: "sig123".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Here is the answer.".to_string(),
+                },
+            ],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(
+            asst.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "replay off keeps the legacy gate: reasoning dropped under disabled thinking"
+        );
+        assert_eq!(asst["content"], "Here is the answer.");
+    }
+
+    #[test]
+    fn full_replay_preserves_historical_reasoning_across_current_effort_flip() {
+        // T07: with `replay = full_assistant`, a stored assistant
+        // reasoning+text message is replayed in FULL even when the CURRENT
+        // request has thinking disabled (effort flip). Historical
+        // reasoning_content must be preserved regardless of the current
+        // request's budget.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "Let me think about this.".to_string(),
+                    signature: "sig123".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "Here is the answer.".to_string(),
+                },
+            ],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert_eq!(
+            asst.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("Let me think about this."),
+            "full replay must preserve stored reasoning under a disabled current request"
+        );
+        assert_eq!(asst["content"], "Here is the answer.");
+        // Current-request OUTPUT control is NOT resurrected: no thinking.type
+        // and the disabled request maps to the lowest Kimi effort (never
+        // enabled, never pinned).
+        assert!(result.thinking.is_none(), "no thinking.type for Kimi");
+        assert_eq!(result.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
+    fn full_replay_history_is_byte_stable_across_current_effort_flips() {
+        // T07 core: the wire form of the stored assistant history must be
+        // IDENTICAL no matter the current request's thinking budget/effort.
+        // The same history converted under thinking-disabled and
+        // thinking-enabled(max) yields byte-equal outbound messages.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let parts = vec![
+            ContentBlock::Thinking {
+                thinking: "step one".to_string(),
+                signature: "sig1".to_string(),
+            },
+            ContentBlock::Text {
+                text: "analysis".to_string(),
+            },
+            ContentBlock::ToolUse {
+                id: "call_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/tmp/x"}),
+            },
+            ContentBlock::ToolUse {
+                id: "call_2".to_string(),
+                name: "grep".to_string(),
+                input: serde_json::json!({"pattern": "foo"}),
+            },
+            ContentBlock::Text {
+                text: "done".to_string(),
+            },
+        ];
+        let enabled = kimi_history_req(Some(thinking_enabled(16000)), parts.clone());
+        let disabled = kimi_history_req(Some(thinking_disabled()), parts);
+        let r1 = convert_request_with_relocation(&enabled, &config, false).unwrap();
+        let r2 = convert_request_with_relocation(&disabled, &config, false).unwrap();
+        assert_eq!(
+            r1.messages, r2.messages,
+            "stored assistant history must be byte-stable across current effort flips"
+        );
+        // And it genuinely carries the full assistant message.
+        let asst = asst_msg(&r2.messages);
+        assert_eq!(
+            asst.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("step one")
+        );
+        assert_eq!(asst["content"], "analysis\ndone");
+        let calls = asst["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0]["id"], "call_1");
+        assert_eq!(calls[1]["id"], "call_2");
+    }
+
+    #[test]
+    fn full_replay_keeps_placeholder_for_toolcall_without_reasoning() {
+        // T07 / kimi=keep: a stored tool-call assistant message with NO
+        // reasoning keeps the safe "(reasoning omitted)" placeholder under
+        // full replay — it is NOT switched to omit without a controlled
+        // probe (report 34 / plan §3.4 note).
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![ContentBlock::ToolUse {
+                id: "toolu_1".to_string(),
+                name: "read_file".to_string(),
+                input: serde_json::json!({"path": "/tmp/test"}),
+            }],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(asst["tool_calls"].is_array());
+        assert_eq!(
+            asst.get("reasoning_content").and_then(|v| v.as_str()),
+            Some("(reasoning omitted)"),
+            "kimi=keep: placeholder retained for tool-call without reasoning"
+        );
+    }
+
+    #[test]
+    fn full_replay_without_official_binding_stays_legacy() {
+        // Fail-closed: `replay = full_assistant` WITHOUT the canonical
+        // "official" upstream binding leaves the legacy gate intact
+        // (data-driven gate, G7 — never a provider-name string).
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay: crate::cache::ReplayPolicy::FullAssistant,
+            history: crate::cache::HistoryPolicy::Off,
+            relocate: crate::cache::RelocatePolicy::Off,
+        });
+        let req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "secret reasoning".to_string(),
+                    signature: "sig".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "answer".to_string(),
+                },
+            ],
+        );
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(
+            asst.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "no official binding => full replay must not activate"
+        );
+    }
+
+    #[test]
+    fn full_replay_does_not_apply_to_non_moonshot_providers() {
+        // Non-moonshot providers are untouched: a deepseek request with a
+        // cache_policy.replay = full_assistant but no official binding (and no
+        // policy at all) keeps the legacy gate byte-for-byte.
+        let config = test_config();
+        let mut req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "ds reasoning".to_string(),
+                    signature: "sig".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "ds answer".to_string(),
+                },
+            ],
+        );
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let asst = asst_msg(&result.messages);
+        assert!(
+            asst.get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .is_none(),
+            "deepseek legacy behavior unchanged under disabled thinking"
+        );
+    }
+
+    #[test]
+    fn full_replay_does_not_inject_prompt_cache_key() {
+        // Phase 4b is history-only: no prompt_cache_key changes (no P3-C
+        // opt-in), even with a stable metadata.user_id present.
+        let config = kimi_replay_config(crate::cache::ReplayPolicy::FullAssistant);
+        let mut req = kimi_history_req(
+            Some(thinking_disabled()),
+            vec![
+                ContentBlock::Thinking {
+                    thinking: "r".to_string(),
+                    signature: "s".to_string(),
+                },
+                ContentBlock::Text {
+                    text: "a".to_string(),
+                },
+            ],
+        );
+        req.metadata = Some(crate::anthropic::types::Metadata {
+            user_id: Some("user-42".to_string()),
+        });
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4c: policy-gated append-only stored-history preservation ---
+    //
+    // With `cache_policy.history = "append_only"` + the canonical official
+    // upstream (data-driven, G7), the chat encoder must never rewrite
+    // already-provided history: orphan tool_calls are not cleaned up,
+    // oversized tool_result bodies are not compacted, repeated results are
+    // not deduplicated. Off (default) or a non-official binding keeps the
+    // legacy rewrites byte-for-byte. The policy governs STORED-HISTORY
+    // preservation only — reasoning replay and current-request output
+    // control are untouched.
+
+    /// Config with the canonical `moonshot` provider bound to the official
+    /// upstream and declaring the given history policy.
+    fn kimi_history_policy_config(history: crate::cache::HistoryPolicy) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: Some("official".to_string()),
+            effort_enum: Some(vec![
+                "low".to_string(),
+                "high".to_string(),
+                "max".to_string(),
+            ]),
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay: crate::cache::ReplayPolicy::Off,
+            history,
+            relocate: crate::cache::RelocatePolicy::Off,
+        });
+        config
+    }
+
+    /// kimi-k3 request whose stored history exercises every legacy rewrite:
+    /// an orphan tool-call assistant turn (no matching result), an oversized
+    /// tool_result body, and a repeated result for the same tool_call_id.
+    fn kimi_append_only_req() -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        let big = "y".repeat(12000);
+        req.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolUse {
+                    id: "toolu_orphan".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Blocks(vec![
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_big".to_string(),
+                        content: crate::anthropic::types::ToolResultContent::Text(big.clone()),
+                        is_error: None,
+                    },
+                    ContentBlock::ToolResult {
+                        tool_use_id: "toolu_big".to_string(),
+                        content: crate::anthropic::types::ToolResultContent::Text(big),
+                        is_error: None,
+                    },
+                ]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("done".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Text("final".to_string()),
+            },
+        ];
+        req
+    }
+
+    #[test]
+    fn append_only_history_preserves_stored_history_on_official() {
+        // T core: with `history = append_only` on the official binding, the
+        // stored history is preserved byte-for-byte — orphan tool_calls are
+        // kept, oversized tool_result bodies are NOT compacted, repeated
+        // results are NOT deduplicated.
+        let config = kimi_history_policy_config(crate::cache::HistoryPolicy::AppendOnly);
+        let result =
+            convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
+
+        // Repeated oversized result preserved in full (both occurrences).
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        let big = "y".repeat(12000);
+        assert_eq!(tools.len(), 2, "append-only: repeated results preserved");
+        assert_eq!(tools[0]["tool_call_id"], "toolu_big");
+        assert_eq!(tools[0]["content"].as_str().unwrap(), big);
+        assert_eq!(tools[1]["tool_call_id"], "toolu_big");
+        assert_eq!(tools[1]["content"].as_str().unwrap(), big);
+
+        // Orphan tool-call assistant preserved.
+        let asst = result
+            .messages
+            .iter()
+            .find(|m| m["role"] == "assistant" && m.get("tool_calls").is_some())
+            .expect("append-only: orphan assistant with tool_calls preserved");
+        assert_eq!(asst["tool_calls"][0]["id"], "toolu_orphan");
+
+        // History-only: current-request output control untouched.
+        assert!(result.thinking.is_none());
+        assert_eq!(result.prompt_cache_key, None);
+    }
+
+    #[test]
+    fn append_only_history_off_keeps_legacy_rewrites() {
+        // Golden policy-off baseline: `history = off` keeps the legacy chat
+        // encoder byte-for-byte — oversized compaction, duplicate dedup and
+        // orphan cleanup all still fire on the official Kimi upstream.
+        let config = kimi_history_policy_config(crate::cache::HistoryPolicy::Off);
+        let result =
+            convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
+
+        // Duplicate result for toolu_big is deduplicated to a single tool msg
+        // and the oversized body is compacted.
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 1, "legacy: duplicate result deduplicated");
+        assert!(
+            tools[0]["content"]
+                .as_str()
+                .unwrap()
+                .contains("bytes truncated"),
+            "legacy: oversized result compacted"
+        );
+
+        // Orphan tool-call assistant is cleaned up.
+        assert!(
+            !result
+                .messages
+                .iter()
+                .any(|m| m["role"] == "assistant" && m.get("tool_calls").is_some()),
+            "legacy: orphan tool-call assistant cleaned up"
+        );
+    }
+
+    #[test]
+    fn append_only_history_without_official_binding_stays_legacy() {
+        // Fail-closed: `history = append_only` WITHOUT the canonical
+        // "official" upstream binding leaves the legacy rewrites intact
+        // (data-driven gate, G7 — never a provider-name string).
+        let mut config = test_config();
+        let moonshot = config.providers.get_mut("moonshot").unwrap();
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::AppendOnly,
+            relocate: crate::cache::RelocatePolicy::Off,
+        });
+        let result =
+            convert_request_with_relocation(&kimi_append_only_req(), &config, false).unwrap();
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(
+            tools.len(),
+            1,
+            "no official binding => legacy dedup/compaction retained"
+        );
+        assert!(tools[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("bytes truncated"));
+    }
+
+    #[test]
+    fn append_only_history_does_not_apply_to_non_moonshot_providers() {
+        // Non-moonshot providers are untouched: a deepseek request (no
+        // policy, no official binding) keeps legacy cleanup/compaction/dedup.
+        let config = test_config();
+        let mut req = kimi_append_only_req();
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let tools: Vec<&Value> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .collect();
+        assert_eq!(tools.len(), 1, "deepseek legacy dedup retained");
+        assert!(tools[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("bytes truncated"));
+    }
+
+    #[test]
+    fn append_only_history_does_not_touch_effort_replay_or_key() {
+        // Phase 4c is history-only: no reasoning_effort/thinking changes, no
+        // replay change (replay stays Off), and no prompt_cache_key injection
+        // (no P3-C opt-in), even with a stable metadata.user_id present.
+        let config = kimi_history_policy_config(crate::cache::HistoryPolicy::AppendOnly);
+        let mut req = kimi_append_only_req();
+        req.metadata = Some(crate::anthropic::types::Metadata {
+            user_id: Some("user-42".to_string()),
+        });
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        assert!(result.thinking.is_none());
+        assert_eq!(result.prompt_cache_key, None);
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(body.get("prompt_cache_key").is_none());
+    }
+
+    // --- Phase 4d: Kimi-only policy-gated split-tail relocation ---
+    //
+    // Data-driven (G7): Chat split-tail relocation activates ONLY when an
+    // explicit `cache_policy.relocate = "split_tail"` opt-in AND the
+    // effective upstream binding resolves to the canonical `"official"`
+    // upstream. Everything else — policy off, no official binding, non-Kimi
+    // providers — keeps the legacy env-driven (`CODEMERMAFROST_RELOCATE`)
+    // relocation path byte-for-byte.
+
+    /// Config with the canonical `moonshot` provider bound to `official`
+    /// and declaring `relocate = split_tail` (plus an optional upstream
+    /// override for fail-closed tests).
+    fn kimi_split_tail_config(upstream: Option<&str>) -> Config {
+        let mut config = test_config();
+        let moonshot = config
+            .providers
+            .get_mut("moonshot")
+            .expect("test config has a moonshot provider");
+        moonshot.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: upstream.map(|s| s.to_string()),
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            relocate: crate::cache::RelocatePolicy::SplitTail,
+        });
+        config
+    }
+
+    /// kimi-k3 request with a volatile env system block and a plain
+    /// user text turn as the current request.
+    fn kimi_env_system_req() -> MessagesRequest {
+        let mut req = kimi_req_with_metadata(None);
+        req.system = Some(SystemPrompt::Blocks(vec![
+            SystemContentBlock {
+                block_type: "text".to_string(),
+                text: "You are a helpful assistant.".to_string(),
+            },
+            SystemContentBlock {
+                block_type: "text".to_string(),
+                text: "<env>\nWorking directory: /tmp\nToday's date: 2026-06-22\n</env>"
+                    .to_string(),
+            },
+        ]));
+        req.messages = vec![Message {
+            role: "user".to_string(),
+            content: ContentValue::Text("hello".to_string()),
+        }];
+        req
+    }
+
+    fn wire_messages(body: &serde_json::Value) -> Vec<serde_json::Value> {
+        body["messages"]
+            .as_array()
+            .expect("outbound messages array")
+            .clone()
+    }
+
+    fn wire_system_content(body: &serde_json::Value) -> String {
+        let messages = wire_messages(body);
+        let sys = messages
+            .iter()
+            .find(|m| m["role"] == "system")
+            .expect("outbound system message");
+        sys["content"].as_str().unwrap_or("").to_string()
+    }
+
+    #[test]
+    fn split_tail_requires_official_binding_fail_closed() {
+        // `relocate = split_tail` WITHOUT the official binding must keep the
+        // legacy path: with the env gate off, the volatile block stays in
+        // the system prompt (fail-closed, data-driven gate).
+        let config = kimi_split_tail_config(None);
+        let result =
+            convert_request_with_relocation(&kimi_env_system_req(), &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let sys = wire_system_content(&body);
+        assert!(
+            sys.contains("<env>") && sys.contains("Today's date"),
+            "no official binding => env block must remain in system: {sys}"
+        );
+    }
+
+    #[test]
+    fn split_tail_non_moonshot_provider_inactive() {
+        // A non-Kimi provider (deepseek) declaring split_tail is untouched:
+        // its effective binding is not official (no policy upstream, no
+        // moonshot-official alias), so the legacy path applies and the env
+        // block stays in the system prompt.
+        let mut config = test_config();
+        let deepseek = config.providers.get_mut("deepseek").unwrap();
+        deepseek.cache_policy = Some(crate::cache::CachePolicy {
+            usage: crate::cache::UsagePolicy::Off,
+            upstream: None,
+            effort_enum: None,
+            replay: crate::cache::ReplayPolicy::Off,
+            history: crate::cache::HistoryPolicy::Off,
+            pinned_effort: None,
+            prompt_cache_key_enabled: false,
+            relocate: crate::cache::RelocatePolicy::SplitTail,
+        });
+        let mut req = kimi_env_system_req();
+        req.model = "deepseek-v4-pro".to_string();
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(
+            wire_system_content(&body).contains("Today's date"),
+            "non-moonshot split_tail must be inactive (fail-closed)"
+        );
+    }
+
+    #[test]
+    fn split_tail_official_kimi_moves_volatile_to_tail_full_converter_path() {
+        // Full inbound converter path: kimi + split_tail + official binding
+        // moves the volatile env block out of the cache-prefix-sensitive
+        // system position into the tail of the last user turn, keeping the
+        // stable system block in the prefix.
+        let config = kimi_split_tail_config(Some("official"));
+        let result =
+            convert_request_with_relocation(&kimi_env_system_req(), &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let sys = wire_system_content(&body);
+        assert!(
+            sys.contains("You are a helpful assistant."),
+            "stable system must stay in prefix: {sys}"
+        );
+        assert!(
+            !sys.contains("Today's date"),
+            "volatile env block must leave the system prefix: {sys}"
+        );
+        let messages = wire_messages(&body);
+        assert_eq!(messages.len(), 2, "system + merged user turn");
+        let last = &messages[messages.len() - 1];
+        assert_eq!(last["role"], "user");
+        let last_content = last["content"].as_str().unwrap_or("");
+        assert!(
+            last_content.contains("permafrost:relocated-context")
+                && last_content.contains("Today's date"),
+            "volatile context must be relocated to the tail: {last_content}"
+        );
+    }
+
+    #[test]
+    fn split_tail_policy_off_keeps_legacy_env_relocate_behavior() {
+        // Policy off (default, no cache_policy) + legacy env gate on
+        // (`relocate = true`) must keep the legacy migrate behavior: the
+        // env block moves into the last user turn exactly as before (the
+        // golden `*_relocate_true` snapshots verify this byte-for-byte).
+        let config = test_config();
+        let result =
+            convert_request_with_relocation(&kimi_env_system_req(), &config, true).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        assert!(!wire_system_content(&body).contains("Today's date"));
+        let messages = wire_messages(&body);
+        assert_eq!(messages.len(), 2, "system + merged user turn (legacy)");
+        let last = &messages[messages.len() - 1];
+        assert_eq!(last["role"], "user");
+        assert!(
+            last["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("permafrost:relocated-context"),
+            "legacy env relocate still merges into the last user turn"
+        );
+    }
+
+    #[test]
+    fn split_tail_does_not_rewrite_stable_history() {
+        // Multi-turn kimi request: earlier (stable) history is emitted
+        // byte-for-byte — only the tail of the final user turn carries the
+        // relocated context.
+        let config = kimi_split_tail_config(Some("official"));
+        let mut req = kimi_env_system_req();
+        req.messages = vec![
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("first user turn".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Text("first answer".to_string()),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("second user turn".to_string()),
+            },
+        ];
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let messages = wire_messages(&body);
+        assert_eq!(messages.len(), 4, "system + 3 history turns");
+        assert_eq!(messages[1]["role"], "user");
+        assert_eq!(messages[1]["content"], "first user turn");
+        assert_eq!(messages[2]["role"], "assistant");
+        assert_eq!(messages[2]["content"], "first answer");
+        let last = &messages[3];
+        assert_eq!(last["role"], "user");
+        let text = last["content"].as_str().unwrap_or("");
+        assert!(text.starts_with("second user turn"));
+        assert!(text.contains("Today's date"));
+        assert!(
+            !messages[1]["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("Today's date"),
+            "stable history must not carry relocated context"
+        );
+    }
+
+    #[test]
+    fn split_tail_is_deterministic_across_calls() {
+        // golden-3 determinism: the same request encodes to the identical
+        // outbound body every time (deterministic tail, no random order).
+        let config = kimi_split_tail_config(Some("official"));
+        let req = kimi_env_system_req();
+        let a =
+            serde_json::to_value(convert_request_with_relocation(&req, &config, false).unwrap())
+                .unwrap();
+        let b =
+            serde_json::to_value(convert_request_with_relocation(&req, &config, false).unwrap())
+                .unwrap();
+        assert_eq!(a, b, "split-tail encode must be deterministic");
+    }
+
+    #[test]
+    fn split_tail_tool_history_tail_shape_preserves_alternation() {
+        // Tool-history shape: the stored history ends with a `user` message
+        // carrying tool_result blocks (renders to `tool` role on the Chat
+        // wire). The volatile appendix cannot merge into it (would be
+        // dropped), so a synthetic `user` tail is appended — the outbound
+        // wire ends assistant(tool_calls) -> tool -> user, which preserves
+        // Chat role alternation and never yields user-after-user.
+        let config = kimi_split_tail_config(Some("official"));
+        let mut req = kimi_env_system_req();
+        req.messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolUse {
+                    id: "call-1".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolResult {
+                    tool_use_id: "call-1".to_string(),
+                    content: crate::anthropic::types::ToolResultContent::Text("ok".to_string()),
+                    is_error: None,
+                }]),
+            },
+        ];
+        let result = convert_request_with_relocation(&req, &config, false).unwrap();
+        let body = serde_json::to_value(&result).unwrap();
+        let messages = wire_messages(&body);
+        assert_eq!(
+            messages.len(),
+            4,
+            "system + assistant(tool_calls) + tool + synthetic user"
+        );
+        let roles: Vec<&str> = messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, vec!["system", "assistant", "tool", "user"]);
+        // The tool role message (call-1 result) is emitted before the tail.
+        let tool_msg = &messages[2];
+        assert_eq!(tool_msg["role"], "tool");
+        assert_eq!(tool_msg["tool_call_id"], "call-1");
+        // The synthetic tail is the last item.
+        let last = &messages[3];
+        assert_eq!(last["role"], "user");
+        let text = last["content"].as_str().unwrap_or("");
+        assert!(
+            text.contains("permafrost:relocated-context") && text.contains("Today's date"),
+            "synthetic tail must carry the relocated volatile context"
+        );
+        let assistant = &messages[1];
+        assert_eq!(assistant["role"], "assistant");
+        assert_eq!(assistant["tool_calls"][0]["id"], "call-1");
     }
 }

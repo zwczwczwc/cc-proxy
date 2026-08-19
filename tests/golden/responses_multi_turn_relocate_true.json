@@ -1,0 +1,71 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "u1",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "a1",
+            "type": "output_text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "u2",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "arguments": "{\"path\":\"/tmp/x\"}",
+        "call_id": "call-1",
+        "name": "read_file",
+        "type": "function_call"
+      },
+      {
+        "call_id": "call-1",
+        "output": "file contents",
+        "type": "function_call_output"
+      },
+      {
+        "content": [
+          {
+            "text": "u3",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "\n\n<permafrost:relocated-context>\nMoved out of the cache prefix so it can change without resetting the cache. Same meaning, later position.\n</permafrost:relocated-context>\n\n<env>\nWorking directory: /home/user\nToday's date: 2026-06-22\nPlatform: linux\ngitStatus: M foo.rs\n</env>\n",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "instructions": "You are a helpful coding assistant.",
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "multi_turn",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "3360528edc21034569caa1f4fc81ff7c5083e62314c3ce3b42fc9879abda34e4",
+  "wire": "responses"
+}

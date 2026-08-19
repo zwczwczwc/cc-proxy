@@ -1,0 +1,32 @@
+{
+  "body": {
+    "max_completion_tokens": 4096,
+    "max_tokens": null,
+    "messages": [
+      {
+        "content": "You are a helpful coding assistant.",
+        "role": "system"
+      },
+      {
+        "content": "hello",
+        "role": "user"
+      },
+      {
+        "content": "hi",
+        "role": "assistant"
+      },
+      {
+        "content": "what now\n\n<permafrost:relocated-context>\nMoved out of the cache prefix so it can change without resetting the cache. Same meaning, later position.\n</permafrost:relocated-context>\n\n<env>\nToday's date: 2026-06-22\nWorking directory: /tmp\n</env>\n",
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": false
+  },
+  "fixture": "env_system",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "3a81d1e5198d4a033ec207d3a17f39523f9cb9390fb240ecf40bcf40dc217396",
+  "wire": "chat"
+}

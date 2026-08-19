@@ -1,0 +1,51 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "hello",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "hi",
+            "type": "output_text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "what now",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "\n\n<permafrost:relocated-context>\nMoved out of the cache prefix so it can change without resetting the cache. Same meaning, later position.\n</permafrost:relocated-context>\n\n<env>\nToday's date: 2026-06-22\nWorking directory: /tmp\n</env>\n",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "instructions": "You are a helpful coding assistant.",
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "env_system",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "ec0c91d13075d30afed61e73ab768e32492f8c950d4c5b0ee62c86290ed38ff3",
+  "wire": "responses"
+}

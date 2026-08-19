@@ -1,10 +1,11 @@
 use super::types::{ReasoningConfig, ResponsesRequest, ResponsesTool};
 use crate::anthropic::types::{
-    ContentBlock, ContentValue, Message, MessagesRequest, SystemPrompt, Tool, ToolChoice,
+    ContentBlock, ContentValue, MessagesRequest, SystemPrompt, Tool, ToolChoice,
 };
 use crate::config::Config;
+use crate::conversation::{AssistantPart, Turn};
+use crate::schema::canonical_hash;
 use serde_json::Value;
-use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result<ResponsesRequest> {
@@ -15,7 +16,7 @@ pub fn convert_request(req: &MessagesRequest, config: &Config) -> anyhow::Result
     )
 }
 
-fn convert_request_with_relocation(
+pub(crate) fn convert_request_with_relocation(
     req: &MessagesRequest,
     config: &Config,
     relocate: bool,
@@ -43,15 +44,19 @@ fn convert_request_with_relocation(
             Vec::new(),
         )
     };
-    let instructions = system_text(Some(&system));
+    // Normalize into the lean Conversation IR (Phase 1, zero behavior change).
+    // Both wires build the same IR; wire vocabulary stays in each encoder.
+    let conversation =
+        crate::conversation::build_conversation(Some(&system), &messages, volatile_texts.clone());
+    let instructions = system_text(conversation.system.as_ref());
     let mut input = Vec::new();
-    for message in &messages {
-        append_message(&mut input, message)?;
+    for turn in &conversation.turns {
+        append_turn(&mut input, turn)?;
     }
-    append_synthetic_context_tail(&mut input, &volatile_texts);
+    append_synthetic_context_tail(&mut input, &conversation.synthetic_tail);
     let tools = req.tools.as_ref().map(|items| {
         let mut converted: Vec<_> = items.iter().map(convert_tool).collect();
-        converted.sort_by(|a, b| a.name.cmp(&b.name));
+        crate::conversation::sort_by_name(&mut converted, |t| &t.name);
         converted
     });
     let tool_choice = req.tool_choice.as_ref().map(convert_tool_choice);
@@ -110,30 +115,6 @@ fn convert_request_with_relocation(
         input_item_types,
         synthetic_tail_present: !volatile_texts.is_empty(),
     })
-}
-
-fn canonical_hash(value: &Value) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(canonical_json(value));
-    hex::encode(&hasher.finalize()[..8])
-}
-
-fn canonical_json(value: &Value) -> Vec<u8> {
-    serde_json::to_vec(&canonicalize(value)).expect("JSON serialization cannot fail")
-}
-
-fn canonicalize(value: &Value) -> Value {
-    match value {
-        Value::Object(object) => {
-            let sorted = object
-                .iter()
-                .map(|(key, value)| (key.clone(), canonicalize(value)))
-                .collect::<std::collections::BTreeMap<_, _>>();
-            Value::Object(sorted.into_iter().collect())
-        }
-        Value::Array(items) => Value::Array(items.iter().map(canonicalize).collect()),
-        _ => value.clone(),
-    }
 }
 
 fn append_synthetic_context_tail(input: &mut Vec<Value>, volatile_texts: &[String]) {
@@ -198,29 +179,44 @@ fn system_text(system: Option<&SystemPrompt>) -> Option<String> {
     (!text.is_empty()).then_some(text)
 }
 
-fn append_message(input: &mut Vec<Value>, message: &Message) -> anyhow::Result<()> {
-    match &message.content {
+/// Append one normalized IR turn to the Responses `input` array.
+fn append_turn(input: &mut Vec<Value>, turn: &Turn) -> anyhow::Result<()> {
+    match turn {
+        Turn::User { content } => append_content_value(input, "user", content),
+        Turn::Unknown { role, content } => append_content_value(input, role, content),
+        Turn::Assistant { parts } => append_assistant_parts(input, parts),
+    }
+}
+
+/// Walk a raw content value with an explicit role (user / unknown passthrough).
+/// Blocks are preserved as-is so the per-block flush behavior stays byte-exact.
+fn append_content_value(
+    input: &mut Vec<Value>,
+    role: &str,
+    content: &ContentValue,
+) -> anyhow::Result<()> {
+    match content {
         ContentValue::Text(text) => input.push(serde_json::json!({
-            "role": message.role,
-            "content": [{"type": text_content_type(&message.role), "text": text}],
+            "role": role,
+            "content": [{"type": text_content_type(role), "text": text}],
         })),
         ContentValue::Null => {}
         ContentValue::Blocks(blocks) => {
-            let mut content = Vec::new();
+            let mut content_items = Vec::new();
             for block in blocks {
                 match block {
-                    ContentBlock::Text { text } => content.push(serde_json::json!({
-                        "type": text_content_type(&message.role),
+                    ContentBlock::Text { text } => content_items.push(serde_json::json!({
+                        "type": text_content_type(role),
                         "text": text,
                     })),
-                    ContentBlock::Image { source } => content.push(serde_json::json!({"type":"input_image", "image_url": format!("data:{};base64,{}", source.media_type, source.data)})),
+                    ContentBlock::Image { source } => content_items.push(serde_json::json!({"type":"input_image", "image_url": format!("data:{};base64,{}", source.media_type, source.data)})),
                     ContentBlock::ToolUse {
                         id,
                         name,
                         input: arguments,
                     } => {
-                        if !content.is_empty() {
-                            input.push(serde_json::json!({"role": message.role, "content": std::mem::take(&mut content)}));
+                        if !content_items.is_empty() {
+                            input.push(serde_json::json!({"role": role, "content": std::mem::take(&mut content_items)}));
                         }
                         input.push(serde_json::json!({"type":"function_call", "call_id": id, "name": name, "arguments": serde_json::to_string(arguments)?}));
                     }
@@ -229,18 +225,61 @@ fn append_message(input: &mut Vec<Value>, message: &Message) -> anyhow::Result<(
                         content: result,
                         ..
                     } => {
-                        if !content.is_empty() {
-                            input.push(serde_json::json!({"role": message.role, "content": std::mem::take(&mut content)}));
+                        if !content_items.is_empty() {
+                            input.push(serde_json::json!({"role": role, "content": std::mem::take(&mut content_items)}));
                         }
                         input.push(serde_json::json!({"type":"function_call_output", "call_id": tool_use_id, "output": tool_result_text(result)}));
                     }
-                    ContentBlock::Thinking { .. } | ContentBlock::RedactedThinking { .. } | ContentBlock::Unknown => {}
+                    ContentBlock::Thinking { .. }
+                    | ContentBlock::RedactedThinking { .. }
+                    | ContentBlock::Unknown => {}
                 }
             }
-            if !content.is_empty() {
-                input.push(serde_json::json!({"role": message.role, "content": content}));
+            if !content_items.is_empty() {
+                input.push(serde_json::json!({"role": role, "content": content_items}));
             }
         }
+    }
+    Ok(())
+}
+
+/// Walk normalized assistant parts. Thinking/redacted is dropped (Responses
+/// never replays it); accumulated text/images are flushed before every
+/// function_call / function_call_output so the interleave stays byte-exact.
+fn append_assistant_parts(input: &mut Vec<Value>, parts: &[AssistantPart]) -> anyhow::Result<()> {
+    let mut content_items: Vec<Value> = Vec::new();
+    for part in parts {
+        match part {
+            AssistantPart::Reasoning(_) => {}
+            AssistantPart::Text(text) => content_items.push(serde_json::json!({
+                "type": "output_text",
+                "text": text,
+            })),
+            AssistantPart::Image { source } => content_items.push(serde_json::json!({"type":"input_image", "image_url": format!("data:{};base64,{}", source.media_type, source.data)})),
+            AssistantPart::ToolCall {
+                id,
+                name,
+                input: arguments,
+            } => {
+                if !content_items.is_empty() {
+                    input.push(serde_json::json!({"role": "assistant", "content": std::mem::take(&mut content_items)}));
+                }
+                input.push(serde_json::json!({"type":"function_call", "call_id": id, "name": name, "arguments": serde_json::to_string(arguments)?}));
+            }
+            AssistantPart::ToolResult {
+                tool_use_id,
+                content: result,
+                ..
+            } => {
+                if !content_items.is_empty() {
+                    input.push(serde_json::json!({"role": "assistant", "content": std::mem::take(&mut content_items)}));
+                }
+                input.push(serde_json::json!({"type":"function_call_output", "call_id": tool_use_id, "output": tool_result_text(result)}));
+            }
+        }
+    }
+    if !content_items.is_empty() {
+        input.push(serde_json::json!({"role": "assistant", "content": content_items}));
     }
     Ok(())
 }
@@ -297,11 +336,36 @@ mod tests {
             "messages":[{"role":"user","content":[{"type":"tool_result","tool_use_id":"call-1","content":"ok"}]}]
         }"#).unwrap();
         let value = serde_json::to_value(
-            convert_request(&result, &crate::config::Config::from_env()).unwrap(),
+            convert_request(&result, &crate::test_support::test_config()).unwrap(),
         )
         .unwrap();
         assert_eq!(value["input"][0]["type"], "function_call_output");
         assert_eq!(value["input"][0]["call_id"], "call-1");
+    }
+
+    #[test]
+    fn responses_request_never_carries_prompt_cache_key() {
+        // Phase 3 P3-C explicit non-goal: the Responses wire must never carry
+        // `prompt_cache_key` (Kimi rides the Chat wire; Responses is only
+        // gpt-5.6-luna). The ResponsesRequest type has no such field — assert
+        // the serialized outbound request omits it even when the inbound
+        // request carries a stable metadata.user_id.
+        let result = serde_json::from_str::<MessagesRequest>(
+            r#"{
+            "model":"gpt-5.6-luna","max_tokens":128,
+            "metadata":{"user_id":"user-42"},
+            "messages":[{"role":"user","content":"hello"}]
+        }"#,
+        )
+        .unwrap();
+        let value = serde_json::to_value(
+            convert_request(&result, &crate::test_support::test_config()).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            value.get("prompt_cache_key").is_none(),
+            "Responses wire must never carry prompt_cache_key: {value}"
+        );
     }
 
     #[test]
@@ -324,6 +388,7 @@ mod tests {
                 effort_param: "reasoning_effort".to_string(),
                 effort_map,
                 responses_reasoning_summary: None,
+                cache_policy: None,
             },
         );
         let mut profile_by_name = HashMap::new();
@@ -378,7 +443,7 @@ mod tests {
 
     #[test]
     fn summary_control_does_not_change_cache_relevant_input_hashes() {
-        let config = crate::config::Config::from_env();
+        let config = crate::test_support::test_config();
         let request = serde_json::from_value::<MessagesRequest>(serde_json::json!({
             "model": "gpt-5.6-luna",
             "max_tokens": 128,
@@ -420,7 +485,7 @@ mod tests {
         .unwrap();
 
         let value = serde_json::to_value(
-            convert_request_with_relocation(&result, &crate::config::Config::from_env(), false)
+            convert_request_with_relocation(&result, &crate::test_support::test_config(), false)
                 .unwrap(),
         )
         .unwrap();
@@ -446,7 +511,7 @@ mod tests {
 
     #[test]
     fn relocated_responses_wire_keeps_three_round_history_stable() {
-        let config = crate::config::Config::from_env();
+        let config = crate::test_support::test_config();
         let first = convert_request_with_relocation(&request("2026-08-05"), &config, true).unwrap();
         let second =
             convert_request_with_relocation(&request("2026-08-06"), &config, true).unwrap();
@@ -463,7 +528,7 @@ mod tests {
 
     #[test]
     fn three_hashes_have_independent_canonical_semantics() {
-        let config = crate::config::Config::from_env();
+        let config = crate::test_support::test_config();
         let base = convert_request_with_relocation(&request("2026-08-05"), &config, true).unwrap();
         let tail_changed =
             convert_request_with_relocation(&request("2026-08-06"), &config, true).unwrap();

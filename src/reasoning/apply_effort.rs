@@ -84,6 +84,7 @@ mod tests {
                 m
             },
             responses_reasoning_summary: None,
+            cache_policy: None,
         }
     }
 
@@ -106,6 +107,7 @@ mod tests {
                 m
             },
             responses_reasoning_summary: None,
+            cache_policy: None,
         }
     }
 

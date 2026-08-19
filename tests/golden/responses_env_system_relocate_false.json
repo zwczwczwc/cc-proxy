@@ -1,0 +1,42 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "hello",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "hi",
+            "type": "output_text"
+          }
+        ],
+        "role": "assistant"
+      },
+      {
+        "content": [
+          {
+            "text": "what now",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "instructions": "You are a helpful coding assistant.\n<env>\nToday's date: 2026-06-22\nWorking directory: /tmp\n</env>",
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "env_system",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "3fb99bbfce2b62b6579fb393fd689861ad906ac2164eed64e054e223398af9b0",
+  "wire": "responses"
+}

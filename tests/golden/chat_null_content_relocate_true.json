@@ -1,0 +1,24 @@
+{
+  "body": {
+    "max_completion_tokens": 4096,
+    "max_tokens": null,
+    "messages": [
+      {
+        "content": "hello",
+        "role": "user"
+      },
+      {
+        "content": null,
+        "role": "assistant"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": false
+  },
+  "fixture": "null_content",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "406c2257c68449721527f0eacc8b4707f8297293e131d4edf8c3ffa4ad94cb84",
+  "wire": "chat"
+}

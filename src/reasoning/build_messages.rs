@@ -1,4 +1,5 @@
 use crate::anthropic::types::{ContentBlock, ContentValue, Message, SystemPrompt};
+use crate::conversation::AssistantPart;
 use serde_json::{json, Value};
 
 /// Compute a hash key for tool_result deduplication (P1-3).
@@ -41,19 +42,42 @@ fn compact_tool_result(content: &str) -> String {
 /// Builds OpenAI-format chat messages from Anthropic Messages API format.
 /// Adapted from CodeWhale chat.rs L1357-L1696.
 /// Returns a Vec<Value> of OpenAI-format messages.
+///
+/// `append_only` (Phase 4c) disables the chat encoder's history rewriting:
+/// orphan `tool_calls` are not cleaned up, `tool_result` bodies are not
+/// compacted, and repeated results are not deduplicated — stored history is
+/// preserved byte-for-byte. `false` (the default) keeps the legacy
+/// cleanup/compaction/dedup behavior.
 pub fn build_chat_messages_with_reasoning(
     system: Option<&SystemPrompt>,
     messages: &[Message],
     include_reasoning: bool,
+    append_only: bool,
+) -> Vec<Value> {
+    let conversation = crate::conversation::build_conversation(system, messages, Vec::new());
+    render_chat_messages(&conversation, include_reasoning, append_only)
+}
+
+/// Render the lean ConversationIR to OpenAI chat wire messages.
+/// Chat-specific safety nets (tool_result dedup/compaction, orphan tool_call
+/// cleanup, reasoning placeholder) stay here on the wire form. In
+/// `append_only` mode (Phase 4c) the cleanup/compaction/dedup safety nets are
+/// disabled so already-provided history is never rewritten; only the
+/// reasoning placeholder (a function of the stored message itself, Phase 4b)
+/// still applies.
+fn render_chat_messages(
+    conversation: &crate::conversation::Conversation,
+    include_reasoning: bool,
+    append_only: bool,
 ) -> Vec<Value> {
     let mut result: Vec<Value> = Vec::new();
 
-    // P1-3: tool_result dedup tracking
+    // P1-3: tool_result dedup tracking (append-only mode never consults it)
     use std::collections::HashMap;
     let mut seen_results: HashMap<String, String> = HashMap::new(); // tool_call_id -> content_hash
 
     // 1. Handle system prompt
-    if let Some(sys) = system {
+    if let Some(sys) = &conversation.system {
         let sys_text = system_prompt_to_text(sys);
         if !sys_text.is_empty() {
             result.push(json!({
@@ -63,18 +87,21 @@ pub fn build_chat_messages_with_reasoning(
         }
     }
 
-    // 2. Convert each message
-    for msg in messages {
-        let role = &msg.role;
-        match role.as_str() {
-            "user" => {
+    // 2. Convert each turn
+    use crate::conversation::Turn;
+    for turn in &conversation.turns {
+        match turn {
+            Turn::User { content } => {
                 // Check if this is actually a tool_result message
-                if let ContentValue::Blocks(blocks) = &msg.content {
+                if let ContentValue::Blocks(blocks) = content {
                     let has_tool_results = blocks
                         .iter()
                         .any(|b| matches!(b, ContentBlock::ToolResult { .. }));
                     if has_tool_results {
-                        // Convert to tool role messages with dedup + compression (P1-3)
+                        // Convert to tool role messages. Default: dedup +
+                        // compression (P1-3). Append-only (Phase 4c): stored
+                        // history is preserved byte-for-byte — no dedup, no
+                        // compaction, order/tool IDs/content bytes intact.
                         for block in blocks {
                             if let ContentBlock::ToolResult {
                                 tool_use_id,
@@ -83,22 +110,26 @@ pub fn build_chat_messages_with_reasoning(
                             } = block
                             {
                                 let text = tool_result_to_text(tool_content);
-                                let result_key = compute_result_key(&text);
-                                let compacted = compact_tool_result(&text);
 
-                                let tool_id = tool_use_id.clone();
-                                if let Some(existing_hash) = seen_results.get(&tool_id) {
-                                    if *existing_hash == result_key {
-                                        // Duplicate result, skip
-                                        continue;
+                                let wire_content = if append_only {
+                                    text
+                                } else {
+                                    let result_key = compute_result_key(&text);
+                                    let tool_id = tool_use_id.clone();
+                                    if let Some(existing_hash) = seen_results.get(&tool_id) {
+                                        if *existing_hash == result_key {
+                                            // Duplicate result, skip
+                                            continue;
+                                        }
                                     }
-                                }
-                                seen_results.insert(tool_id, result_key);
+                                    seen_results.insert(tool_id, result_key);
+                                    compact_tool_result(&text)
+                                };
 
                                 let content = if let Some(true) = is_error {
-                                    format!("[ERROR] {}", compacted)
+                                    format!("[ERROR] {}", wire_content)
                                 } else {
-                                    compacted
+                                    wire_content
                                 };
                                 result.push(json!({
                                     "role": "tool",
@@ -110,19 +141,19 @@ pub fn build_chat_messages_with_reasoning(
                         continue;
                     }
                 }
-                let openai_msg = convert_user_message(&msg.content);
+                let openai_msg = convert_user_message(content);
                 result.push(json!({
                     "role": "user",
                     "content": openai_msg,
                 }));
             }
-            "assistant" => {
-                let openai_msg = convert_assistant_message(&msg.content, include_reasoning);
+            Turn::Assistant { parts } => {
+                let openai_msg = convert_assistant_parts(parts, include_reasoning);
                 result.push(openai_msg);
             }
-            _ => {
+            Turn::Unknown { role, content } => {
                 // Unknown role, keep as-is
-                let content = content_value_to_json(&msg.content);
+                let content = content_value_to_json(content);
                 result.push(json!({
                     "role": role,
                     "content": content,
@@ -131,8 +162,12 @@ pub fn build_chat_messages_with_reasoning(
         }
     }
 
-    // 3. Clean up orphan tool_calls (safety net from L1587-L1693)
-    cleanup_orphan_tool_calls(&mut result);
+    // 3. Clean up orphan tool_calls (safety net from L1587-L1693).
+    //    Phase 4c: disabled under append-only — stored history (including
+    //    orphaned tool_calls and their results) is preserved byte-for-byte.
+    if !append_only {
+        cleanup_orphan_tool_calls(&mut result);
+    }
 
     result
 }
@@ -256,42 +291,20 @@ fn tool_result_to_text(content: &crate::anthropic::types::ToolResultContent) -> 
     }
 }
 
-fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) -> Value {
-    let blocks = match content {
-        ContentValue::Text(text) => {
-            return json!({
-                "role": "assistant",
-                "content": text,
-            });
-        }
-        ContentValue::Null => {
-            return json!({
-                "role": "assistant",
-                "content": null,
-            });
-        }
-        ContentValue::Blocks(b) => b,
-    };
-
+fn convert_assistant_parts(parts: &[AssistantPart], include_reasoning: bool) -> Value {
     let mut thinking_parts: Vec<String> = Vec::new();
     let mut text_parts: Vec<String> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
 
-    for block in blocks {
-        match block {
-            ContentBlock::Thinking {
-                thinking,
-                signature: _,
-            } => {
-                thinking_parts.push(thinking.clone());
+    for part in parts {
+        match part {
+            AssistantPart::Reasoning(text) => {
+                thinking_parts.push(text.clone());
             }
-            ContentBlock::RedactedThinking { data: _ } => {
-                thinking_parts.push("(redacted thinking)".to_string());
-            }
-            ContentBlock::Text { text } => {
+            AssistantPart::Text(text) => {
                 text_parts.push(text.clone());
             }
-            ContentBlock::ToolUse { id, name, input } => {
+            AssistantPart::ToolCall { id, name, input } => {
                 tool_calls.push(json!({
                     "id": id,
                     "type": "function",
@@ -301,7 +314,9 @@ fn convert_assistant_message(content: &ContentValue, include_reasoning: bool) ->
                     }
                 }));
             }
-            _ => {}
+            // ToolResult / Image inside an assistant message are dropped by the
+            // Chat encoder (matches the pre-IR `_ => {}` behavior).
+            AssistantPart::ToolResult { .. } | AssistantPart::Image { .. } => {}
         }
     }
 
@@ -456,7 +471,7 @@ mod tests {
             role: "user".to_string(),
             content: ContentValue::Text("hello".to_string()),
         }];
-        let result = build_chat_messages_with_reasoning(None, &messages, false);
+        let result = build_chat_messages_with_reasoning(None, &messages, false, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "user");
         assert_eq!(result[0]["content"], "hello");
@@ -478,7 +493,7 @@ mod tests {
                 },
             ]),
         }];
-        let result = build_chat_messages_with_reasoning(None, &messages, true);
+        let result = build_chat_messages_with_reasoning(None, &messages, true, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
         // Fix: reasoning_content should contain actual thinking text
@@ -496,7 +511,7 @@ mod tests {
                 input: serde_json::json!({"path": "/tmp/test"}),
             }]),
         }];
-        let result = build_chat_messages_with_reasoning(None, &messages, true);
+        let result = build_chat_messages_with_reasoning(None, &messages, true, false);
         assert_eq!(result[0]["reasoning_content"], "(reasoning omitted)");
         assert!(result[0]["tool_calls"].is_array());
     }
@@ -510,6 +525,7 @@ mod tests {
         let result = build_chat_messages_with_reasoning(
             Some(&SystemPrompt::Text("You are helpful".to_string())),
             &messages,
+            false,
             false,
         );
         assert_eq!(result.len(), 2);
@@ -534,7 +550,7 @@ mod tests {
                 },
             ]),
         }];
-        let result = build_chat_messages_with_reasoning(None, &messages, true);
+        let result = build_chat_messages_with_reasoning(None, &messages, true, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["role"], "assistant");
         assert_eq!(result[0]["reasoning_content"], "I should read the file");
@@ -556,7 +572,7 @@ mod tests {
                 },
             ]),
         }];
-        let result = build_chat_messages_with_reasoning(None, &messages, false);
+        let result = build_chat_messages_with_reasoning(None, &messages, false, false);
         assert_eq!(result.len(), 1);
         assert!(
             result[0].get("reasoning_content").is_none()
@@ -579,9 +595,219 @@ mod tests {
                 },
             ]),
         }];
-        let result = build_chat_messages_with_reasoning(None, &messages, true);
+        let result = build_chat_messages_with_reasoning(None, &messages, true, false);
         assert_eq!(result.len(), 1);
         assert_eq!(result[0]["reasoning_content"], "(redacted thinking)");
         assert_eq!(result[0]["content"], "redacted response");
+    }
+
+    // --- Phase 4c: append-only stored-history preservation ---
+    //
+    // `append_only=true` must never rewrite already-provided history on the
+    // wire: orphan tool_calls are not cleaned up, oversized tool_result bodies
+    // are not compacted, repeated results are not deduplicated — order, tool
+    // IDs and content bytes are preserved exactly as stored. `false` (the
+    // default) keeps the legacy cleanup/compaction/dedup byte-for-byte.
+
+    fn tool_result_block(id: &str, text: &str) -> ContentBlock {
+        ContentBlock::ToolResult {
+            tool_use_id: id.to_string(),
+            content: crate::anthropic::types::ToolResultContent::Text(text.to_string()),
+            is_error: None,
+        }
+    }
+
+    #[test]
+    fn append_only_preserves_orphan_tool_calls() {
+        // Stored assistant tool_calls with NO matching tool result are
+        // "orphans" (cleanup_orphan_tool_calls only strips them from
+        // NON-final assistant messages). Legacy drops the orphan tool-call
+        // assistant message entirely (empty content); append-only must keep
+        // the tool_calls intact.
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolUse {
+                    id: "toolu_orphan".to_string(),
+                    name: "read_file".to_string(),
+                    input: serde_json::json!({"path": "/tmp/x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("interlude".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Text("final answer".to_string()),
+            },
+        ];
+
+        let legacy = build_chat_messages_with_reasoning(None, &messages, false, false);
+        let legacy_assts: Vec<&Value> =
+            legacy.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(
+            legacy_assts.len(),
+            1,
+            "legacy: orphan tool-call assistant is cleaned up, only the final remains"
+        );
+        assert_eq!(legacy_assts[0]["content"], "final answer");
+
+        let preserved = build_chat_messages_with_reasoning(None, &messages, false, true);
+        let asst = preserved
+            .iter()
+            .find(|m| m["role"] == "assistant")
+            .expect("append-only: orphan assistant message must be preserved");
+        let calls = asst["tool_calls"].as_array().expect("tool_calls array");
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0]["id"], "toolu_orphan");
+        // The final assistant message survives too.
+        assert!(preserved
+            .iter()
+            .any(|m| m["role"] == "assistant" && m["content"] == "final answer"));
+    }
+
+    #[test]
+    fn append_only_preserves_oversized_tool_result() {
+        // A tool_result body larger than the 4000+4000 compaction window is
+        // truncated by the legacy encoder; append-only must keep the full
+        // bytes (order, tool IDs and content bytes preserved).
+        let big = "x".repeat(12000);
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: ContentValue::Blocks(vec![tool_result_block("toolu_big", &big)]),
+        }];
+
+        let legacy = build_chat_messages_with_reasoning(None, &messages, false, false);
+        let tool = legacy
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("legacy: tool message present");
+        let legacy_content = tool["content"].as_str().unwrap();
+        assert!(
+            legacy_content.len() < big.len() && legacy_content.contains("bytes truncated"),
+            "legacy must compact the oversized result"
+        );
+
+        let preserved = build_chat_messages_with_reasoning(None, &messages, false, true);
+        let tool = preserved
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("append-only: tool message present");
+        assert_eq!(
+            tool["content"].as_str().unwrap(),
+            big,
+            "append-only must preserve the full result bytes"
+        );
+        assert_eq!(tool["tool_call_id"], "toolu_big");
+    }
+
+    #[test]
+    fn append_only_preserves_repeated_tool_results() {
+        // The P1-3 dedup drops a repeated result for the same tool_call_id.
+        // Append-only must keep every occurrence, in order, with IDs and
+        // content bytes intact.
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: ContentValue::Blocks(vec![
+                tool_result_block("toolu_dup", "result A"),
+                tool_result_block("toolu_dup", "result A"),
+            ]),
+        }];
+
+        let legacy = build_chat_messages_with_reasoning(None, &messages, false, false);
+        let legacy_tools: Vec<&Value> = legacy.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(
+            legacy_tools.len(),
+            1,
+            "legacy: duplicate result for the same id is deduplicated"
+        );
+
+        let preserved = build_chat_messages_with_reasoning(None, &messages, false, true);
+        let tools: Vec<&Value> = preserved.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(
+            tools.len(),
+            2,
+            "append-only: repeated results are preserved"
+        );
+        assert_eq!(tools[0]["tool_call_id"], "toolu_dup");
+        assert_eq!(tools[0]["content"], "result A");
+        assert_eq!(tools[1]["tool_call_id"], "toolu_dup");
+        assert_eq!(tools[1]["content"], "result A");
+    }
+
+    #[test]
+    fn append_only_preserves_order_and_ids() {
+        // Order, tool IDs and content bytes are preserved exactly as stored.
+        let messages = vec![Message {
+            role: "user".to_string(),
+            content: ContentValue::Blocks(vec![
+                tool_result_block("toolu_b", "beta"),
+                tool_result_block("toolu_a", "alpha"),
+                tool_result_block("toolu_c", "gamma"),
+            ]),
+        }];
+
+        let preserved = build_chat_messages_with_reasoning(None, &messages, false, true);
+        let ids: Vec<&str> = preserved
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["tool_call_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["toolu_b", "toolu_a", "toolu_c"]);
+        let contents: Vec<&str> = preserved
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(contents, vec!["beta", "alpha", "gamma"]);
+    }
+
+    #[test]
+    fn off_retains_legacy_cleanup_compaction_dedup() {
+        // Golden policy-off baseline: with append_only=false every legacy
+        // safety net still fires in one combined history — orphan cleanup,
+        // oversized-result compaction and duplicate-result dedup.
+        let big = "z".repeat(12000);
+        let messages = vec![
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Blocks(vec![ContentBlock::ToolUse {
+                    id: "toolu_orphan".to_string(),
+                    name: "grep".to_string(),
+                    input: serde_json::json!({"q": "x"}),
+                }]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Blocks(vec![
+                    tool_result_block("toolu_big", &big),
+                    tool_result_block("toolu_big", &big),
+                ]),
+            },
+            Message {
+                role: "user".to_string(),
+                content: ContentValue::Text("done".to_string()),
+            },
+            Message {
+                role: "assistant".to_string(),
+                content: ContentValue::Text("final".to_string()),
+            },
+        ];
+
+        let legacy = build_chat_messages_with_reasoning(None, &messages, false, false);
+        // Orphan assistant (non-final, no matching result) is removed.
+        let assts: Vec<&Value> = legacy.iter().filter(|m| m["role"] == "assistant").collect();
+        assert_eq!(assts.len(), 1, "orphan assistant cleaned up");
+        assert_eq!(assts[0]["content"], "final");
+        // Duplicate result for toolu_big is deduplicated to a single tool msg.
+        let tools: Vec<&Value> = legacy.iter().filter(|m| m["role"] == "tool").collect();
+        assert_eq!(tools.len(), 1, "duplicate result deduplicated");
+        // Oversized result is compacted.
+        let content = tools[0]["content"].as_str().unwrap();
+        assert!(
+            content.len() < big.len() && content.contains("bytes truncated"),
+            "oversized result compacted"
+        );
     }
 }

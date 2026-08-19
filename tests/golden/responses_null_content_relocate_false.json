@@ -1,0 +1,23 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "hello",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      }
+    ],
+    "max_output_tokens": 4096,
+    "model": "gpt-5.6-luna",
+    "stream": false
+  },
+  "fixture": "null_content",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "e41ba45467355fb531d04f675e222e920b533c04f0f30d6e0155fb59a0e38125",
+  "wire": "responses"
+}

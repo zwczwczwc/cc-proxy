@@ -24,21 +24,21 @@ pub struct MessagesRequest {
     pub top_k: Option<u32>,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum SystemPrompt {
     Text(String),
     Blocks(Vec<SystemContentBlock>),
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct SystemContentBlock {
     #[serde(rename = "type")]
     pub block_type: String,
     pub text: String,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct Message {
     pub role: String,
     pub content: ContentValue,
@@ -54,7 +54,7 @@ enum ContentValueInner {
     Raw(serde_json::Value),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ContentValue {
     Text(String),
     Blocks(Vec<ContentBlock>),
@@ -90,11 +90,7 @@ impl<'de> Deserialize<'de> for ContentValue {
     }
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "response input variants preserve Anthropic protocol fields"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum ContentBlock {
     #[serde(rename = "text")]
@@ -123,7 +119,7 @@ pub enum ContentBlock {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(untagged)]
 pub enum ToolResultContent {
     Text(String),
@@ -132,11 +128,7 @@ pub enum ToolResultContent {
 
 /// A single content block inside a tool_result.
 /// Anthropic API supports text and image blocks in tool results.
-#[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "tool result image fields are deserialized for protocol compatibility"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(tag = "type")]
 pub enum ToolResultContentBlock {
     #[serde(rename = "text")]
@@ -148,11 +140,7 @@ pub enum ToolResultContentBlock {
     Unknown,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "image source fields are deserialized for protocol compatibility"
-)]
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 pub struct ImageSource {
     #[serde(rename = "type")]
     pub source_type: String,
@@ -185,17 +173,34 @@ pub enum ThinkingConfig {
 }
 
 impl ThinkingConfig {
+    /// Semantic check driven by the wire `type` string, NOT the untagged variant.
+    ///
+    /// `ThinkingConfig` is `#[serde(untagged)]` with `Enabled` declared first and
+    /// every field optional, so serde deserializes ANY thinking object — including
+    /// `{"type":"disabled"}` — into the `Enabled` variant. The variant is therefore
+    /// not a reliable signal: `{"type":"disabled"}` used to be treated as enabled,
+    /// which sent `reasoning_effort=high` upstream instead of turning thinking off.
+    /// The `config_type` string is the source of truth.
     pub fn is_enabled(&self) -> bool {
-        matches!(
-            self,
-            ThinkingConfig::Enabled { .. } | ThinkingConfig::Adaptive { .. }
-        )
+        matches!(self.type_str(), "enabled" | "adaptive")
+    }
+
+    /// Wire type string (identical across all untagged variants).
+    pub fn type_str(&self) -> &str {
+        match self {
+            ThinkingConfig::Enabled { config_type, .. } => config_type,
+            ThinkingConfig::Disabled { config_type } => config_type,
+            ThinkingConfig::Adaptive { config_type, .. } => config_type,
+        }
     }
 
     pub fn budget_tokens(&self) -> Option<u32> {
         match self {
-            ThinkingConfig::Enabled { budget_tokens, .. } => *budget_tokens,
-            ThinkingConfig::Adaptive { .. } => None,
+            ThinkingConfig::Enabled {
+                config_type,
+                budget_tokens,
+                ..
+            } if config_type == "enabled" => *budget_tokens,
             _ => None,
         }
     }
@@ -221,11 +226,10 @@ pub enum ToolChoice {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[expect(
-    dead_code,
-    reason = "metadata is deserialized for protocol compatibility"
-)]
 pub struct Metadata {
+    /// Stable per-session identifier. Phase 3 P3-C reads this as the
+    /// inbound source for the deterministic Chat `prompt_cache_key` when the
+    /// provider's cache policy opts in (fail-closed: None/empty ⇒ no key).
     pub user_id: Option<String>,
 }
 
@@ -363,4 +367,41 @@ pub struct StreamUsage {
     pub cache_read_input_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_creation_input_tokens: Option<u32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: `{"type":"disabled"}` must NOT be treated as enabled.
+    ///
+    /// `ThinkingConfig` is `#[serde(untagged)]` with `Enabled` declared first and all
+    /// fields optional, so serde deserializes the JSON into the `Enabled` variant even
+    /// for `disabled`/`adaptive` type strings. `is_enabled()` must therefore read the
+    /// wire `type` string, not the untagged variant (b01860f bug: disabled requests
+    /// were sent upstream with `reasoning_effort=high` instead of `low`).
+    #[test]
+    fn disabled_type_string_is_not_enabled() {
+        let parsed: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"disabled"}"#).expect("deserialize disabled");
+        assert!(!parsed.is_enabled());
+        assert_eq!(parsed.type_str(), "disabled");
+    }
+
+    #[test]
+    fn enabled_type_string_is_enabled() {
+        let parsed: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"enabled","budget_tokens":4096}"#)
+                .expect("deserialize enabled");
+        assert!(parsed.is_enabled());
+        assert_eq!(parsed.budget_tokens(), Some(4096));
+    }
+
+    #[test]
+    fn adaptive_type_string_is_enabled() {
+        let parsed: ThinkingConfig =
+            serde_json::from_str(r#"{"type":"adaptive"}"#).expect("deserialize adaptive");
+        assert!(parsed.is_enabled());
+        assert_eq!(parsed.budget_tokens(), None);
+    }
 }

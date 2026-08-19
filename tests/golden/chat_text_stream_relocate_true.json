@@ -1,0 +1,27 @@
+{
+  "body": {
+    "max_completion_tokens": 4096,
+    "max_tokens": null,
+    "messages": [
+      {
+        "content": "You are a helpful coding assistant.",
+        "role": "system"
+      },
+      {
+        "content": "hello",
+        "role": "user"
+      }
+    ],
+    "model": "kimi-k3",
+    "reasoning_effort": "max",
+    "stream": true,
+    "stream_options": {
+      "include_usage": true
+    }
+  },
+  "fixture": "text_stream",
+  "relocate": true,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "28c7f18ee5803e3cd83fe46dbf5134891a68989ee3a1e36114fc295ba1d49560",
+  "wire": "chat"
+}

@@ -1,0 +1,37 @@
+{
+  "body": {
+    "input": [
+      {
+        "content": [
+          {
+            "text": "q1",
+            "type": "input_text"
+          }
+        ],
+        "role": "user"
+      },
+      {
+        "content": [
+          {
+            "text": "a1",
+            "type": "output_text"
+          }
+        ],
+        "role": "assistant"
+      }
+    ],
+    "instructions": "You are a helpful coding assistant.",
+    "max_output_tokens": 32768,
+    "model": "gpt-5.6-luna",
+    "reasoning": {
+      "effort": "max",
+      "summary": "auto"
+    },
+    "stream": false
+  },
+  "fixture": "thinking",
+  "relocate": false,
+  "schema": "cc-proxy-golden/v1",
+  "sha256": "bbc76cf58ec369106bfcdd31a9bd5d626425caa9524d264a6fea5db3a58d2498",
+  "wire": "responses"
+}
