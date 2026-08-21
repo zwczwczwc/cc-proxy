@@ -5,16 +5,17 @@
 default = "deepseek-v4-pro"
 
 [models.mapping]
-# L1: Opus → gpt-5.6-luna (Responses)
-"claude-opus-4-7" = "gpt-5.6-luna"
-"claude-opus-4-6" = "gpt-5.6-luna"
-"claude-opus-4-5" = "gpt-5.6-luna"
-"claude-opus-4" = "gpt-5.6-luna"
-# L2: Sonnet → gpt-5.6-luna (sonnet-4-6) / deepseek-v4-pro (others)
-"claude-sonnet-4-6" = "gpt-5.6-luna"
-"claude-sonnet-4-5" = "deepseek-v4-pro"
-"claude-sonnet-4" = "deepseek-v4-pro"
-"claude-3-5-sonnet" = "deepseek-v4-pro"
+# L1: Opus → glm-5.3（2026-08-21 分层：方案设计层）
+"claude-opus-4-7" = "glm-5.3"
+"claude-opus-4-6" = "glm-5.3"
+"claude-opus-4-5" = "glm-5.3"
+"claude-opus-4" = "glm-5.3"
+# L2: Sonnet → deepseek-v4-flash（2026-08-21 分层：主要承接层，sonnet=haiku=flash max）
+"claude-sonnet-4-7" = "deepseek-v4-flash"
+"claude-sonnet-4-6" = "deepseek-v4-flash"
+"claude-sonnet-4-5" = "deepseek-v4-flash"
+"claude-sonnet-4"   = "deepseek-v4-flash"
+"claude-3-5-sonnet" = "deepseek-v4-flash"
 # L3: Haiku → deepseek-v4-flash (implement/debug)
 "claude-haiku-4-5" = "deepseek-v4-flash"
 "claude-haiku-4" = "deepseek-v4-flash"
@@ -39,6 +40,33 @@ high = "high"
 max = "max"
 xhigh = "max"
 
+# 月之暗面官方（Kimi For Coding，api.kimi.com/coding）——OpenAI 格式，
+# reasoning 以 reasoning_content 返回；端点与密钥经 MOONSHOT_OFFICIAL_URL/API_KEY 注入。
+[providers.moonshot-official]
+reasoning_field = "reasoning_content"
+reasoning_field_alt = ["reasoning"]
+disable_thinking = true
+effort_param = "reasoning_effort"
+
+[providers.moonshot-official.effort_map]
+low = "low"
+medium = "low"
+high = "high"
+max = "max"
+xhigh = "max"
+
+# Phase 3 opt-in (P3-B fail-fast + telemetry + upstream binding)
+# Declaring effort_enum means every effort_map output must be in {low,high,max} - satisfied.
+[providers.moonshot-official.cache_policy]
+usage = "top_level_cached_tokens"
+upstream = "official"
+effort_enum = ["low", "high", "max"]
+pinned_effort = "high"
+prompt_cache_key_enabled = false
+replay = "full_assistant"
+history = "append_only"
+relocate = "split_tail"
+
 [providers.glm]
 reasoning_field = "reasoning_content"
 thinking_param = "thinking"
@@ -53,20 +81,9 @@ minimal = "minimal"
 low = "low"
 medium = "medium"
 high = "high"
-xhigh = "xhigh"
-max = "max"
-
-[providers.moonshot]
-reasoning_field = "reasoning"
-disable_thinking = true
-effort_param = "reasoning_effort"
-
-[providers.moonshot.effort_map]
-low = "low"
-medium = "medium"
-high = "high"
-max = "max"
 xhigh = "max"
+max = "max"
+
 
 [providers.gpt]
 reasoning_field = ""
@@ -87,14 +104,6 @@ xhigh = "xhigh"
 # ── 模型 Profile ─��
 
 [[model_profiles]]
-name = "deepseek-v4-pro"
-provider = "deepseek"
-reasoning_enabled = true
-reasoning_replay = true
-toolcall_requires_reasoning = true
-aliases = ["deepseek-chat", "deepseek-reasoner"]
-
-[[model_profiles]]
 name = "deepseek-v4-flash"
 provider = "deepseek"
 reasoning_enabled = true
@@ -109,10 +118,17 @@ reasoning_enabled = true
 reasoning_replay = false
 toolcall_requires_reasoning = false
 aliases = []
+[[model_profiles]]
+name = "glm-5.3"
+provider = "glm"
+reasoning_enabled = true
+reasoning_replay = false
+toolcall_requires_reasoning = false
+aliases = []
 
 [[model_profiles]]
 name = "kimi-k3"
-provider = "moonshot"
+provider = "moonshot-official"
 reasoning_enabled = true
 reasoning_replay = true
 toolcall_requires_reasoning = false
@@ -126,3 +142,10 @@ reasoning_enabled = true
 reasoning_replay = false
 toolcall_requires_reasoning = false
 aliases = ["gpt-5.6-luna-2026-07-09"]
+[[model_profiles]]
+name = "deepseek-v4-pro"
+provider = "deepseek"
+reasoning_enabled = true
+reasoning_replay = true
+toolcall_requires_reasoning = true
+aliases = ["deepseek-chat", "deepseek-reasoner"]
