@@ -708,7 +708,13 @@ pub fn process_stream(
             "Responses stream EOF without terminal event"
         );
     });
-    Sse::new(EventStream(rx))
+    // Keep-alive: see src/sse/stream.rs — Claude Code aborts a byte-silent
+    // stream after 300s, and this upstream emits no pings of its own.
+    Sse::new(EventStream(rx)).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(30))
+            .text("ping"),
+    )
 }
 
 #[cfg(test)]
