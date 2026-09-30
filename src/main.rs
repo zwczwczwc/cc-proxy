@@ -3,6 +3,7 @@ mod cache;
 mod client;
 mod config;
 mod conversation;
+mod errors;
 mod openai;
 mod reasoning;
 mod responses;

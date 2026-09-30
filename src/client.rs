@@ -7,8 +7,12 @@ use std::time::{Duration, Instant};
 
 /// Sanitize error response body: truncate + redact sensitive fields.
 fn sanitize_error_body(body: &str) -> String {
-    let truncated = if body.len() > 1024 {
-        format!("{}...[truncated]", &body[..1024])
+    // NOTE: `&body[..1024]` panics when byte 1024 falls inside a multi-byte
+    // character — and this deployment's upstream errors are Chinese, where the
+    // cut nearly always lands mid-character. Truncate on a char boundary.
+    const MAX: usize = 1024;
+    let truncated = if body.len() > MAX {
+        format!("{}...[truncated]", crate::errors::truncate_chars(body, MAX))
     } else {
         body.to_string()
     };

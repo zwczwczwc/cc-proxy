@@ -119,7 +119,7 @@ async fn handle_messages(
         if stream {
             let byte_stream = match upstream_client.responses_completion_stream(&responses_req).await {
                 Ok(stream) => stream,
-                Err(e) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
+                Err(e) => return (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":crate::errors::message_only(&e.to_string(), e.to_string())}}))).into_response(),
             };
             return crate::responses::stream::process_stream(
                 upstream_model,
@@ -132,10 +132,10 @@ async fn handle_messages(
         }
         return match upstream_client.responses_completion(&responses_req).await {
             Ok(value) => match serde_json::from_value::<crate::responses::types::ResponsesResponse>(value) {
-                Ok(response) => match crate::responses::convert_response(&response, &upstream_model, &msg_id, cache_policy.as_ref()) { Ok(result) => (StatusCode::OK, Json(result)).into_response(), Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response() },
-                Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
+                Ok(response) => match crate::responses::convert_response(&response, &upstream_model, &msg_id, cache_policy.as_ref()) { Ok(result) => (StatusCode::OK, Json(result)).into_response(), Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":crate::errors::message_only(&e.to_string(), e.to_string())}}))).into_response() },
+                Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":crate::errors::message_only(&e.to_string(), e.to_string())}}))).into_response(),
             },
-            Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":e.to_string()}}))).into_response(),
+            Err(e) => (StatusCode::BAD_GATEWAY, Json(serde_json::json!({"type":"error","error":{"type":"api_error","message":crate::errors::message_only(&e.to_string(), e.to_string())}}))).into_response(),
         };
     }
 
@@ -165,7 +165,7 @@ async fn handle_messages(
         let byte_stream = loop {
             match upstream_client.chat_completion_stream(&openai_req).await {
                 Ok(s) => break s,
-                Err(e) if retries < max_retries => {
+                Err(e) if retries < max_retries && crate::errors::is_retryable(&e.to_string()) => {
                     retries += 1;
                     let delay = Duration::from_secs(2u64.pow(retries));
                     tracing::warn!(
@@ -179,14 +179,31 @@ async fn handle_messages(
                     continue;
                 }
                 Err(e) => {
-                    tracing::error!("Stream request failed after {} retries: {}", max_retries, e);
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": format!("Upstream error after {} retries: {}", max_retries, e),
+                    let retryable = crate::errors::is_retryable(&e.to_string());
+                    tracing::error!(
+                        "{}",
+                        if retryable {
+                            format!("Stream request failed after {} retries: {}", max_retries, e)
+                        } else {
+                            // 确定性 4xx：一次都不重试，日志必须如实说明
+                            format!("Stream request failed (deterministic error, 0 retries attempted): {}", e)
                         }
-                    }))).into_response();
+                    );
+                    let text = e.to_string();
+                    let fallback = format!("Upstream error after {} retries: {}", max_retries, e);
+                    // A-full: status + type + message resolved by contract mode
+                    let (status, message) = crate::errors::resolve(&text, 500, fallback);
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        Json(serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": crate::errors::err_type_for(status),
+                                "message": message,
+                            }
+                        })),
+                    )
+                        .into_response();
                 }
             }
         };
@@ -210,7 +227,7 @@ async fn handle_messages(
         let openai_resp = loop {
             match upstream_client.chat_completion(&openai_req).await {
                 Ok(r) => break r,
-                Err(e) if retries < max_retries => {
+                Err(e) if retries < max_retries && crate::errors::is_retryable(&e.to_string()) => {
                     retries += 1;
                     let delay = Duration::from_secs(2u64.pow(retries));
                     tracing::warn!(
@@ -224,18 +241,30 @@ async fn handle_messages(
                     continue;
                 }
                 Err(e) => {
+                    let retryable = crate::errors::is_retryable(&e.to_string());
                     tracing::error!(
-                        "Non-stream request failed after {} retries: {}",
-                        max_retries,
-                        e
-                    );
-                    return (StatusCode::INTERNAL_SERVER_ERROR, Json(serde_json::json!({
-                        "type": "error",
-                        "error": {
-                            "type": "api_error",
-                            "message": format!("Upstream error after {} retries: {}", max_retries, e),
+                        "{}",
+                        if retryable {
+                            format!("Non-stream request failed after {} retries: {}", max_retries, e)
+                        } else {
+                            format!("Non-stream request failed (deterministic error, 0 retries attempted): {}", e)
                         }
-                    }))).into_response();
+                    );
+                    let text = e.to_string();
+                    let fallback = format!("Upstream error after {} retries: {}", max_retries, e);
+                    // A-full: status + type + message resolved by contract mode
+                    let (status, message) = crate::errors::resolve(&text, 500, fallback);
+                    return (
+                        StatusCode::from_u16(status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+                        Json(serde_json::json!({
+                            "type": "error",
+                            "error": {
+                                "type": crate::errors::err_type_for(status),
+                                "message": message,
+                            }
+                        })),
+                    )
+                        .into_response();
                 }
             }
         };

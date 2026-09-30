@@ -203,6 +203,33 @@ pub fn process_stream(
                             }
                         };
 
+                        // In-band upstream error frames: some OpenAI-compatible
+                        // gateways report a failure as a normal SSE chunk
+                        // (`data: {"error": {...}}`) with no `choices` field.
+                        // Previously such a frame was parsed and silently
+                        // ignored, so the stream ended as an empty-but-successful
+                        // message (observed: 35-40 empty responses). Surface it.
+                        if let Some(err_obj) = chunk_value.get("error") {
+                            let raw = err_obj
+                                .get("message")
+                                .and_then(|v| v.as_str())
+                                .map(|s| s.to_string())
+                                .unwrap_or_else(|| err_obj.to_string());
+                            tracing::warn!(
+                                upstream_error = %raw,
+                                "in-band upstream error frame — surfacing as stream error"
+                            );
+                            let message = crate::errors::maybe_capability_message(&raw, raw.clone());
+                            let error_event = sse_event_to_axum(&SseEvent::Error {
+                                error: crate::anthropic::types::ErrorData {
+                                    error_type: "api_error".to_string(),
+                                    message,
+                                },
+                            });
+                            let _ = tx.send(error_event).await;
+                            break;
+                        }
+
                         // Extract usage
                         let usage: Option<crate::openai::types::Usage> = chunk_value
                             .get("usage")
@@ -441,7 +468,14 @@ pub fn process_stream(
         drop(tx);
     });
 
-    Sse::new(SseEventStream { receiver: rx })
+    // Keep-alive: Claude Code's byte-level watchdog aborts a stream that goes
+    // silent for 300s by default, and the upstream does not emit SSE pings —
+    // during long thinking pauses these comment frames are the only traffic.
+    Sse::new(SseEventStream { receiver: rx }).keep_alive(
+        axum::response::sse::KeepAlive::new()
+            .interval(std::time::Duration::from_secs(30))
+            .text("ping"),
+    )
 }
 
 #[cfg(test)]
